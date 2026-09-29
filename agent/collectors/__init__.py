@@ -1,0 +1,1 @@
+"""Platform-aware hardware and system inventory collectors."""

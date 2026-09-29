@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Inventário | Prefeitura Remote</title>
+  <link rel="stylesheet" href="/dashboard/css/dashboard.css">
+  <script src="/dashboard/js/dashboard.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="Prefeitura Remote, início">
+      <span class="brand-mark" aria-hidden="true">PR</span>
+      <span class="brand-name">Prefeitura <b>Remote</b></span>
+    </a>
+    <div class="topbar-right">
+      <span class="service-indicator"><span class="indicator-dot"></span> Central de inventário</span>
+      <button class="icon-button hidden" id="logout-button" type="button" title="Encerrar acesso" aria-label="Encerrar acesso">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 17l5-5-5-5M15 12H3m9-8h7a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-7"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <main class="workspace">
+    <section class="login-panel" id="login-panel" aria-labelledby="login-title">
+      <div class="login-heading">
+        <span class="eyebrow">ACESSO RESTRITO</span>
+        <h1 id="login-title">Entrar no painel</h1>
+        <p>Acesse com a credencial de técnico.</p>
+      </div>
+      <form id="login-form">
+        <label for="token-input">Token do painel</label>
+        <div class="input-with-button">
+          <input id="token-input" name="token" type="password" autocomplete="current-password" required>
+          <button class="primary-button" type="submit">Acessar</button>
+        </div>
+        <p class="form-error" id="login-error" role="alert"></p>
+      </form>
+    </section>
+
+    <section class="app-view hidden" id="app-view" aria-label="Inventário de computadores">
+      <div class="page-heading">
+        <div>
+          <span class="eyebrow">SUPORTE DE TI · ATIVOS</span>
+          <h1>Computadores</h1>
+        </div>
+        <button class="refresh-button" id="refresh-button" type="button" title="Atualizar lista">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5M6.1 9a7 7 0 0 1 11.5-2L20 12M4 12l2.4 5a7 7 0 0 0 11.5-2"/></svg>
+          <span>Atualizar</span>
+        </button>
+      </div>
+
+      <div class="summary-strip" aria-label="Resumo de dispositivos">
+        <div class="summary-item"><span class="summary-label">DISPOSITIVOS</span><strong id="total-count">--</strong></div>
+        <div class="summary-item"><span class="summary-label">ONLINE</span><strong class="online-text" id="online-count">--</strong></div>
+        <div class="summary-item"><span class="summary-label">OFFLINE</span><strong class="offline-text" id="offline-count">--</strong></div>
+        <div class="summary-item"><span class="summary-label">CANAIS WS</span><strong class="online-text" id="channel-count">--</strong></div>
+        <span class="updated-at" id="updated-at"></span>
+      </div>
+
+      <div class="content-grid">
+        <section class="computer-list" aria-label="Lista de computadores">
+          <div class="list-toolbar">
+            <div class="list-filters">
+              <label class="search-field" for="search-input">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.8" cy="10.8" r="6.8"/><path d="m16 16 4.5 4.5"/></svg>
+                <input id="search-input" type="search" placeholder="Buscar por hostname" autocomplete="off">
+                <kbd>/</kbd>
+              </label>
+              <label class="authorization-filter" for="authorization-filter">
+                <span>Autorização</span>
+                <select id="authorization-filter">
+                  <option value="">Todos os estados</option>
+                  <option value="pending">Pending</option>
+                  <option value="authorized">Authorized</option>
+                  <option value="revoked">Revoked</option>
+                </select>
+              </label>
+            </div>
+            <span class="result-count" id="result-count"></span>
+          </div>
+          <div class="table-scroll">
+            <table>
+              <thead><tr><th scope="col">COMPUTADOR</th><th scope="col">USUÁRIO</th><th scope="col">SISTEMA</th><th scope="col">AUTORIZAÇÃO</th><th scope="col">AGENTE</th><th scope="col">CANAL WS</th><th scope="col">VISTO POR ÚLTIMO</th></tr></thead>
+              <tbody id="computer-rows"><tr><td class="empty-state" colspan="7">Aguardando acesso ao painel.</td></tr></tbody>
+            </table>
+          </div>
+        </section>
+
+        <aside class="detail-panel" id="detail-panel" aria-live="polite">
+          <div class="detail-placeholder">
+            <span class="detail-symbol" aria-hidden="true">⌘</span>
+            <h2>Selecione um computador</h2>
+            <p>Os dados do equipamento aparecerão aqui.</p>
+          </div>
+        </aside>
+      </div>
+      <p class="global-error" id="global-error" role="status"></p>
+    </section>
+  </main>
+  <footer class="footer"><span>Prefeitura Remote</span><span>Inventário de ativos</span></footer>
+</body>
+</html>

@@ -1,0 +1,4 @@
+psutil>=5.9,<8
+websockets>=13,<18
+mss>=9,<11
+Pillow>=10,<13

@@ -1,0 +1,1 @@
+"""Business logic for inventory updates and computer status."""
