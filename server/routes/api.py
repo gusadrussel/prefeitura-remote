@@ -21,6 +21,7 @@ from server.services.inventory import (
 from server.services.rate_limits import peer_address
 from server.services.agent_credentials import has_active_agent_credential, verify_agent_credential
 from server.services.screen_streams import ScreenTicketCapacityError
+from server.services.remote_consent import ConsentCapacityError
 
 LOGGER = logging.getLogger("prefeitura_remote.server")
 router = APIRouter()
@@ -214,8 +215,8 @@ def revoke_computer(
     return _update_authorization(session, computer_id, "revoked", request)
 
 
-@router.post("/api/v1/admin/computers/{computer_id}/screen/viewer-ticket")
-def create_screen_viewer_ticket(
+@router.post("/api/v1/admin/computers/{computer_id}/screen/access-request", status_code=202)
+def create_remote_access_request(
     computer_id: int,
     request: Request,
     _authorized: None = Depends(dashboard_auth),
@@ -224,36 +225,123 @@ def create_screen_viewer_ticket(
     computer = session.get(request.app.state.computer_model, computer_id)
     if computer is None:
         raise HTTPException(status_code=404, detail="Computador não encontrado")
+    settings = request.app.state.settings
     if (
         computer.authorization_status != "authorized"
-        or not has_active_agent_credential(computer, request.app.state.settings)
+        or not has_active_agent_credential(computer, settings)
     ):
         raise HTTPException(status_code=403, detail="Computador não autorizado")
     connection = request.app.state.agent_connections.get(computer.agent_id)
     if not connection or not connection.connected or connection.computer_id != computer.id:
         raise HTTPException(status_code=409, detail="Agente não conectado ao canal")
-    settings = request.app.state.settings
-    rate_key = f"viewer-ticket:{peer_address(request.client)}:{computer.id}"
+    rate_key = f"remote-consent:{peer_address(request.client)}:{computer.id}"
     if not request.app.state.rate_limiter.allow(
         rate_key,
-        limit=settings.viewer_ticket_requests_per_window,
+        limit=settings.remote_consent_requests_per_window,
         window_seconds=settings.rate_limit_window_seconds,
     ):
         raise HTTPException(
             status_code=429,
-            detail="Muitas solicitações de visualização para este computador",
+            detail="Muitas solicitações de acesso remoto para este computador",
             headers={"Retry-After": str(settings.rate_limit_window_seconds)},
         )
     try:
-        ticket, expires_in = request.app.state.screen_streams.issue_ticket(
-            computer.agent_id, computer.id
+        consent = request.app.state.remote_consent.create(
+            computer.agent_id,
+            computer.id,
+            settings.dashboard_operator_name,
+            ttl_seconds=settings.remote_consent_ttl_seconds,
         )
-    except ScreenTicketCapacityError:
+    except ConsentCapacityError:
         raise HTTPException(
             status_code=429,
-            detail="Limite de solicitações de visualização atingido; tente novamente mais tarde",
+            detail="Limite de solicitações de acesso remoto atingido; tente novamente mais tarde",
         ) from None
-    return {"ticket": ticket, "expires_in": expires_in}
+    if not request.app.state.agent_connections.send(
+        computer.agent_id,
+        {
+            "type": "session.consent_request",
+            "request_id": consent.request_id,
+            "technician_name": consent.technician_name,
+            "hostname": computer.hostname,
+            "expires_in": settings.remote_consent_ttl_seconds,
+        },
+    ):
+        request.app.state.remote_consent.cancel_for_computer(computer.id, "agent_unavailable")
+        raise HTTPException(status_code=409, detail="Não foi possível solicitar confirmação no computador")
+    LOGGER.info(
+        "remote_access_consent_requested technician=%s computer_id=%s agent_id=%s request_id=%s",
+        consent.technician_name, computer.id, computer.agent_id, consent.request_id,
+    )
+    return {
+        "request_id": consent.request_id,
+        "status": consent.status,
+        "technician_name": consent.technician_name,
+        "expires_in": settings.remote_consent_ttl_seconds,
+    }
+
+
+@router.post("/api/v1/admin/computers/{computer_id}/screen/access-request/{request_id}/cancel")
+def cancel_remote_access_request(
+    computer_id: int,
+    request_id: str,
+    request: Request,
+    _authorized: None = Depends(dashboard_auth),
+):
+    consent = request.app.state.remote_consent.get(request_id)
+    if consent is None or consent.computer_id != computer_id:
+        raise HTTPException(status_code=404, detail="Solicitação não encontrada")
+    request.app.state.remote_consent.cancel_for_computer(computer_id, "technician_cancelled")
+    request.app.state.agent_connections.send_urgent(
+        consent.agent_id,
+        {"type": "session.remote_stop", "reason": "technician_cancelled"},
+    )
+    return {"status": "cancelled"}
+
+
+@router.get("/api/v1/admin/computers/{computer_id}/screen/access-request/{request_id}")
+def get_remote_access_request(
+    computer_id: int,
+    request_id: str,
+    request: Request,
+    _authorized: None = Depends(dashboard_auth),
+    session: Session = Depends(get_session),
+):
+    consent = request.app.state.remote_consent.get(request_id)
+    if consent is None or consent.computer_id != computer_id:
+        raise HTTPException(status_code=404, detail="Solicitação não encontrada")
+    computer = session.get(request.app.state.computer_model, computer_id)
+    if computer is None:
+        raise HTTPException(status_code=404, detail="Computador não encontrado")
+    if consent.status == "approved" and consent.ticket is None:
+        if (
+            computer.authorization_status != "authorized"
+            or not has_active_agent_credential(computer, request.app.state.settings)
+            or not (connection := request.app.state.agent_connections.get(computer.agent_id))
+            or not connection.connected
+        ):
+            consent.status = "cancelled"
+            consent.reason = "authorization_or_channel_changed"
+        else:
+            try:
+                ticket, expires_in = request.app.state.screen_streams.issue_ticket(
+                    computer.agent_id, computer.id
+                )
+            except ScreenTicketCapacityError:
+                return {"status": "approved", "technician_name": consent.technician_name}
+            request.app.state.remote_consent.attach_ticket(request_id, ticket, expires_in)
+            LOGGER.info(
+                "remote_access_consent_approved technician=%s computer_id=%s agent_id=%s request_id=%s",
+                consent.technician_name, computer.id, computer.agent_id, request_id,
+            )
+    response = {
+        "status": consent.status,
+        "technician_name": consent.technician_name,
+        "reason": consent.reason,
+    }
+    if consent.ticket is not None:
+        response.update({"ticket": consent.ticket, "expires_in": consent.ticket_expires_in})
+    return response
 
 
 def _update_authorization(
@@ -288,6 +376,9 @@ def _update_authorization(
         computer.authorization_status,
     )
     if computer.authorization_status != "authorized":
+        request.app.state.remote_consent.cancel_for_computer(
+            computer.id, "authorization_revoked"
+        )
         request.app.state.agent_connections.send_urgent(
             computer.agent_id,
             {"type": "session.stop", "reason": "authorization_revoked"},

@@ -74,7 +74,7 @@ class AuthorizationMigrationTests(unittest.TestCase):
                 self.assertEqual(listed.status_code, 200)
                 self.assertEqual(listed.json()[0]["authorization_status"], "pending")
                 ticket_response = client.post(
-                    "/api/v1/admin/computers/1/screen/viewer-ticket",
+                    "/api/v1/admin/computers/1/screen/access-request",
                     headers=dashboard_headers,
                 )
                 self.assertEqual(ticket_response.status_code, 403)

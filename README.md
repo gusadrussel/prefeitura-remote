@@ -137,3 +137,6 @@ python -m unittest discover -v
 ## Limites e próximos passos
 
 Este MVP ainda não oferece cadastro administrativo prévio de máquinas. A ingestão atual registra agentes com o token compartilhado; produção deve evoluir para credenciais individuais revogáveis e autenticação de técnicos para atribuição individual na auditoria. PostgreSQL está preparado via URL de conexão, mas não foi validado contra um servidor PostgreSQL neste ambiente. Coletores dependentes de CIM, módulos SMBIOS, GPU e detalhes físicos devem ser homologados em modelos reais de computadores Windows da prefeitura.
+## Consentimento para acesso remoto
+
+O acesso remoto exige aprovação explícita do usuário no computador.

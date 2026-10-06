@@ -29,6 +29,9 @@ class Settings:
     viewer_ticket_requests_per_window: int = 20
     authorization_changes_per_window: int = 20
     websocket_connections_per_window: int = 60
+    dashboard_operator_name: str = "Técnico da TI"
+    remote_consent_ttl_seconds: int = 60
+    remote_consent_requests_per_window: int = 10
 
     def __post_init__(self) -> None:
         limits = (
@@ -38,6 +41,8 @@ class Settings:
             self.viewer_ticket_requests_per_window,
             self.authorization_changes_per_window,
             self.websocket_connections_per_window,
+            self.remote_consent_ttl_seconds,
+            self.remote_consent_requests_per_window,
         )
         if any(value < 1 for value in limits):
             raise ValueError("Rate limits and windows must be positive integers")
@@ -76,4 +81,7 @@ def load_settings() -> Settings:
         websocket_connections_per_window=int(
             os.getenv("PREFEITURA_WEBSOCKET_CONNECTION_LIMIT", "60")
         ),
+        dashboard_operator_name=os.getenv("PREFEITURA_DASHBOARD_OPERATOR_NAME", "Técnico da TI").strip() or "Técnico da TI",
+        remote_consent_ttl_seconds=int(os.getenv("PREFEITURA_REMOTE_CONSENT_TTL", "60")),
+        remote_consent_requests_per_window=int(os.getenv("PREFEITURA_REMOTE_CONSENT_LIMIT", "10")),
     )

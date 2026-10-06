@@ -266,7 +266,66 @@ async def agent_channel(websocket: WebSocket, agent_id: str) -> None:
                 break
 
             message_type = message.get("type")
-            if message_type == "heartbeat":
+            if message_type == "session.consent_response":
+                if (
+                    set(message) != {"type", "request_id", "accepted"}
+                    or not isinstance(message["request_id"], str)
+                    or not isinstance(message["accepted"], bool)
+                ):
+                    await websocket.close(code=1003, reason="Resposta de consentimento inválida")
+                    break
+                consent = websocket.app.state.remote_consent.respond(
+                    message["request_id"], agent_id, computer.id, message["accepted"]
+                )
+                if consent is None:
+                    continue
+                if consent.status == "approved":
+                    current = _find_authorized_computer(websocket, agent_id)
+                    if current is None:
+                        consent.status = "cancelled"
+                        consent.reason = "authorization_revoked"
+                        registry.send(agent_id, {
+                            "type": "session.consent_result",
+                            "request_id": consent.request_id,
+                            "approved": False,
+                            "reason": consent.reason,
+                        })
+                    else:
+                        registry.send(agent_id, {
+                            "type": "session.consent_result",
+                            "request_id": consent.request_id,
+                            "approved": True,
+                            "reason": "user_accepted",
+                        })
+                        LOGGER.info(
+                            "remote_access_consent_response technician=%s computer_id=%s agent_id=%s request_id=%s approved=true",
+                            consent.technician_name, computer.id, agent_id, consent.request_id,
+                        )
+                else:
+                    registry.send(agent_id, {
+                        "type": "session.consent_result",
+                        "request_id": consent.request_id,
+                        "approved": False,
+                        "reason": consent.reason or "user_rejected",
+                    })
+                    LOGGER.info(
+                        "remote_access_consent_response technician=%s computer_id=%s agent_id=%s request_id=%s approved=false reason=%s",
+                        consent.technician_name, computer.id, agent_id, consent.request_id, consent.reason,
+                    )
+            elif message_type == "session.user_stop":
+                if set(message) != {"type", "request_id"} or not isinstance(message["request_id"], str):
+                    await websocket.close(code=1003, reason="Parada de sessão inválida")
+                    break
+                consent = websocket.app.state.remote_consent.get(message["request_id"])
+                if consent is not None and consent.agent_id == agent_id and consent.computer_id == computer.id:
+                    websocket.app.state.remote_consent.cancel_for_computer(computer.id, "user_stopped")
+                screen_streams.agent_disconnected(agent_id)
+                registry.send(agent_id, {"type": "session.remote_stop", "reason": "user_stopped"})
+                LOGGER.info(
+                    "remote_access_ended_by_user computer_id=%s agent_id=%s request_id=%s",
+                    computer.id, agent_id, message["request_id"],
+                )
+            elif message_type == "heartbeat":
                 if not _credential_is_valid(websocket, agent_id):
                     await _close_policy(websocket, "Credencial do agente revogada ou inválida")
                     break

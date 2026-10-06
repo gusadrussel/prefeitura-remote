@@ -17,6 +17,8 @@
   let screenSocket = null;
   let screenComputerId = null;
   let screenState = "idle";
+  let screenConsentRequestId = null;
+  let screenConsentPollTimer = null;
   let screenFrameData = null;
   let screenLastFrameAt = null;
   let screenRenderSequence = 0;
@@ -213,7 +215,7 @@
       ${section("ARMAZENAMENTO", (disks || `<div class="hardware-item"><span>Nenhum disco identificado.</span></div>`) + (volumes || ""))}
       ${gpus ? section("VÍDEO", gpus) : ""}
       ${section("PLACA-MÃE E BIOS", detailRow("Fabricante", board.manufacturer) + detailRow("Modelo", board.model) + detailRow("Serial placa-mãe", board.serial) + detailRow("BIOS", bios.version) + detailRow("Serial BIOS", bios.serial))}
-      ${section("VISUALIZAÇÃO DA TELA", `<div class="screen-meta"><span>Máquina: <strong>${escapeHtml(computer.hostname)}</strong></span><span>Canal: <strong>${computer.channel_connected ? "Conectado" : "Desconectado"}</strong></span><span>Transmissão: <strong data-screen-status>${escapeHtml(screenStateLabel())}</strong></span><span>Último frame: <strong data-screen-last-frame>${escapeHtml(formatTime(screenLastFrameAt))}</strong></span></div><div class="screen-viewer" data-screen-viewer><div class="screen-actions"><button class="screen-button" type="button" data-screen-action="start" ${!canStartScreen || screenBusy ? "disabled" : ""}>Iniciar visualização</button><button class="screen-button screen-stop-button" type="button" data-screen-action="stop" ${!screenBusy || screenState === "connecting" ? "disabled" : ""}>Parar</button><button class="screen-button" type="button" data-screen-action="control-start" ${!canStartControl ? "disabled" : ""}>Iniciar controle</button><button class="screen-button screen-stop-button" type="button" data-screen-action="control-stop" ${controlState === "idle" || controlState === "error" ? "disabled" : ""}>Encerrar controle</button><button class="screen-button screen-fullscreen-button" type="button" data-screen-action="fullscreen" ${screenState !== "streaming" ? "disabled" : ""}>Tela cheia</button><span class="control-status" data-control-status>${escapeHtml(controlStateLabel())}</span><span class="fullscreen-status" data-fullscreen-status>Janela</span></div><p class="control-error" data-control-error role="status">${escapeHtml(controlErrorMessage)}</p><div class="screen-frame-wrap" data-screen-frame tabindex="0" aria-label="Visualização remota de ${escapeHtml(computer.hostname)}">${screenFrame}</div></div><p class="screen-fullscreen-error" data-screen-fullscreen-error role="status"></p><p class="screen-hint">A transmissão só começa após solicitação do técnico.</p>`)}
+      ${section("VISUALIZAÇÃO DA TELA", `<div class="screen-meta"><span>Máquina: <strong>${escapeHtml(computer.hostname)}</strong></span><span>Canal: <strong>${computer.channel_connected ? "Conectado" : "Desconectado"}</strong></span><span>Transmissão: <strong data-screen-status>${escapeHtml(screenStateLabel())}</strong></span><span>Último frame: <strong data-screen-last-frame>${escapeHtml(formatTime(screenLastFrameAt))}</strong></span></div><div class="screen-viewer" data-screen-viewer><div class="screen-actions"><button class="screen-button" type="button" data-screen-action="start" ${!canStartScreen || screenBusy ? "disabled" : ""}>Solicitar acesso</button><button class="screen-button screen-stop-button" type="button" data-screen-action="stop" ${!screenBusy || screenState === "connecting" ? "disabled" : ""}>Parar</button><button class="screen-button" type="button" data-screen-action="control-start" ${!canStartControl ? "disabled" : ""}>Iniciar controle</button><button class="screen-button screen-stop-button" type="button" data-screen-action="control-stop" ${controlState === "idle" || controlState === "error" ? "disabled" : ""}>Encerrar controle</button><button class="screen-button screen-fullscreen-button" type="button" data-screen-action="fullscreen" ${screenState !== "streaming" ? "disabled" : ""}>Tela cheia</button><span class="control-status" data-control-status>${escapeHtml(controlStateLabel())}</span><span class="fullscreen-status" data-fullscreen-status>Janela</span></div><p class="control-error" data-control-error role="status">${escapeHtml(controlErrorMessage)}</p><div class="screen-frame-wrap" data-screen-frame tabindex="0" aria-label="Visualização remota de ${escapeHtml(computer.hostname)}">${screenFrame}</div></div><p class="screen-fullscreen-error" data-screen-fullscreen-error role="status"></p><p class="screen-hint">O usuário do computador precisa aceitar a solicitação antes de a tela ser compartilhada.</p>`)}
       ${section("REDE", detailRow("Gateways", (inventory.network?.gateways || []).join(", ")) + detailRow("DNS", (inventory.network?.dns_servers || []).join(", ")) + (network || `<div class="hardware-item"><span>Interfaces não disponíveis.</span></div>`))}`;
     detailPanel.querySelector("[data-authorization-action]")?.addEventListener("click", (event) => {
       changeAuthorization(computer.id, event.currentTarget.dataset.authorizationAction);
@@ -468,6 +470,7 @@
     return ({
       idle: "Parado",
       connecting: "Conectando",
+      consent: "Aguardando aprovação do usuário",
       starting: "Iniciando",
       streaming: "Transmitindo",
       stopping: "Parando",
@@ -486,10 +489,10 @@
     if (startButton) {
       const computer = computers.find((item) => item.id === selectedId);
       startButton.disabled = !computer || computer.authorization_status !== "authorized"
-        || !computer.channel_connected || ["connecting", "starting", "streaming", "stopping"].includes(screenState);
+        || !computer.channel_connected || ["connecting", "consent", "starting", "streaming", "stopping"].includes(screenState);
     }
     if (stopButton) {
-      stopButton.disabled = !["starting", "streaming", "stopping"].includes(screenState);
+      stopButton.disabled = !["consent", "starting", "streaming", "stopping"].includes(screenState);
     }
     updateControlControls();
     updateFullscreenButton();
@@ -507,7 +510,8 @@
     }
     closeScreenViewer();
     screenComputerId = computer.id;
-    screenState = "connecting";
+    screenState = "consent";
+    screenConsentRequestId = null;
     screenFrameData = null;
     screenLastFrameAt = null;
     controlState = "idle";
@@ -515,114 +519,156 @@
     screenRemoteHeight = 0;
     clearHeldInputState();
     const frameWrap = detailPanel.querySelector("[data-screen-frame]");
-    if (frameWrap) frameWrap.innerHTML = '<div class="screen-placeholder">Aguardando primeiro frame</div>';
+    if (frameWrap) frameWrap.innerHTML = '<div class="screen-placeholder">Aguardando aprovação do usuário no computador</div>';
     updateScreenStatus();
     try {
-      const result = await api(`/api/v1/admin/computers/${computer.id}/screen/viewer-ticket`, { method: "POST" });
-      const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-      const socket = new WebSocket(
-        `${protocol}//${location.host}/ws/admin/computers/${computer.id}/screen?ticket=${encodeURIComponent(result.ticket)}`
-      );
-      screenSocket = socket;
-      socket.addEventListener("open", () => {
-        if (screenSocket !== socket) return;
-        screenState = "starting";
-        updateScreenStatus();
-        socket.send(JSON.stringify({ type: "screen.start" }));
-      });
-      socket.addEventListener("message", (event) => {
-        if (screenSocket !== socket) return;
-        let message;
-        try { message = JSON.parse(event.data); } catch { return; }
-        if (message.type === "screen.start_ack") {
-          screenState = message.accepted ? "streaming" : "error";
-          screenRemoteWidth = Number.isInteger(message.screen_width) ? message.screen_width : 0;
-          screenRemoteHeight = Number.isInteger(message.screen_height) ? message.screen_height : 0;
-          updateScreenStatus(message.accepted ? "Transmitindo" : `Indisponível: ${message.reason || "captura recusada"}`);
-        } else if (message.type === "screen.frame" && typeof message.data === "string") {
-          screenLastFrameAt = new Date().toISOString();
-          screenState = "streaming";
-          const renderSequence = ++screenRenderSequence;
-          const nextFrame = new Image();
-          nextFrame.className = "screen-frame";
-          nextFrame.alt = `Tela de ${computer.hostname}`;
-          nextFrame.src = `data:image/jpeg;base64,${message.data}`;
-          nextFrame.decode().then(() => {
-            if (screenSocket !== socket || renderSequence !== screenRenderSequence) return;
-            screenFrameData = message.data;
-            const frameWrap = detailPanel.querySelector("[data-screen-frame]");
-            if (!frameWrap) return;
-            const currentFrame = frameWrap.querySelector(".screen-frame");
-            if (currentFrame) currentFrame.replaceWith(nextFrame);
-            else frameWrap.replaceChildren(nextFrame);
-          }).catch(() => {});
-          updateScreenStatus("Transmitindo");
-        } else if (message.type === "control.start_ack") {
-          console.info("[remote-control] start ack", {
-            accepted: message.accepted === true,
-            reason: message.reason || "accepted",
-          });
-          if (message.accepted === true
-            && Number.isInteger(message.screen_width) && Number.isInteger(message.screen_height)
-            && message.screen_width === screenRemoteWidth && message.screen_height === screenRemoteHeight) {
-            controlState = "active";
-            controlErrorMessage = "";
-            detailPanel.querySelector("[data-screen-frame]")?.focus({ preventScroll: true });
-            updateScreenStatus("Controle ativo");
-          } else {
-            controlState = "error";
-            controlErrorMessage = message.reason || "screen_resolution_mismatch";
-            if (message.accepted === true && screenSocket === socket) {
-              socket.send(JSON.stringify({ type: "control.stop" }));
-            }
-            updateScreenStatus("Controle não iniciado");
+      const requestResult = await api(`/api/v1/admin/computers/${computer.id}/screen/access-request`, { method: "POST" });
+      if (screenComputerId !== computer.id || screenState !== "consent") return;
+      screenConsentRequestId = requestResult.request_id;
+      const deadline = Date.now() + Number(requestResult.expires_in || 60) * 1000 + 1000;
+      const poll = async () => {
+        if (screenComputerId !== computer.id || screenState !== "consent" || !screenConsentRequestId) return;
+        try {
+          const result = await api(`/api/v1/admin/computers/${computer.id}/screen/access-request/${encodeURIComponent(screenConsentRequestId)}`);
+          if (result.status === "approved" && result.ticket) {
+            screenConsentRequestId = null;
+            screenState = "connecting";
+            updateScreenStatus("Acesso aprovado; conectando");
+            const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+            const socket = new WebSocket(
+              `${protocol}//${location.host}/ws/admin/computers/${computer.id}/screen?ticket=${encodeURIComponent(result.ticket)}`
+            );
+            screenSocket = socket;
+            socket.addEventListener("open", () => {
+              if (screenSocket !== socket) return;
+              screenState = "starting";
+              updateScreenStatus();
+              socket.send(JSON.stringify({ type: "screen.start" }));
+            });
+            socket.addEventListener("message", (event) => {
+              if (screenSocket !== socket) return;
+              let message;
+              try { message = JSON.parse(event.data); } catch { return; }
+              if (message.type === "screen.start_ack") {
+                screenState = message.accepted ? "streaming" : "error";
+                screenRemoteWidth = Number.isInteger(message.screen_width) ? message.screen_width : 0;
+                screenRemoteHeight = Number.isInteger(message.screen_height) ? message.screen_height : 0;
+                updateScreenStatus(message.accepted ? "Transmitindo" : `Indisponível: ${message.reason || "captura recusada"}`);
+              } else if (message.type === "screen.frame" && typeof message.data === "string") {
+                screenLastFrameAt = new Date().toISOString();
+                screenState = "streaming";
+                const renderSequence = ++screenRenderSequence;
+                const nextFrame = new Image();
+                nextFrame.className = "screen-frame";
+                nextFrame.alt = `Tela de ${computer.hostname}`;
+                nextFrame.src = `data:image/jpeg;base64,${message.data}`;
+                nextFrame.decode().then(() => {
+                  if (screenSocket !== socket || renderSequence !== screenRenderSequence) return;
+                  screenFrameData = message.data;
+                  const frameWrap = detailPanel.querySelector("[data-screen-frame]");
+                  if (!frameWrap) return;
+                  const currentFrame = frameWrap.querySelector(".screen-frame");
+                  if (currentFrame) currentFrame.replaceWith(nextFrame);
+                  else frameWrap.replaceChildren(nextFrame);
+                }).catch(() => {});
+                updateScreenStatus("Transmitindo");
+              } else if (message.type === "control.start_ack") {
+                console.info("[remote-control] start ack", {
+                  accepted: message.accepted === true,
+                  reason: message.reason || "accepted",
+                });
+                if (message.accepted === true
+                  && Number.isInteger(message.screen_width) && Number.isInteger(message.screen_height)
+                  && message.screen_width === screenRemoteWidth && message.screen_height === screenRemoteHeight) {
+                  controlState = "active";
+                  controlErrorMessage = "";
+                  detailPanel.querySelector("[data-screen-frame]")?.focus({ preventScroll: true });
+                  updateScreenStatus("Controle ativo");
+                } else {
+                  controlState = "error";
+                  controlErrorMessage = message.reason || "screen_resolution_mismatch";
+                  if (message.accepted === true && screenSocket === socket) {
+                    socket.send(JSON.stringify({ type: "control.stop" }));
+                  }
+                  updateScreenStatus("Controle não iniciado");
+                }
+              } else if (message.type === "control.stop_ack") {
+                console.info("[remote-control] stop ack", { reason: message.reason || "operator_request" });
+                controlState = "idle";
+                controlErrorMessage = message.reason && message.reason !== "operator_request"
+                  ? `Encerrado: ${message.reason}` : "";
+                clearHeldInputState();
+                updateScreenStatus(controlErrorMessage || "Controle encerrado");
+              } else if (message.type === "screen.stop_ack") {
+                screenState = "stopped";
+                controlState = "idle";
+                screenRemoteWidth = 0;
+                screenRemoteHeight = 0;
+                clearHeldInputState();
+                updateScreenStatus("Parado");
+              }
+            });
+            socket.addEventListener("close", (event) => {
+              if (screenSocket !== socket) return;
+              console.warn("[screen-viewer] websocket closed", { code: event.code, reason: event.reason || "no_reason" });
+              screenSocket = null;
+              screenComputerId = null;
+              screenState = "stopped";
+              controlState = "idle";
+              clearHeldInputState();
+              updateScreenStatus("Canal de visualização encerrado");
+            });
+            socket.addEventListener("error", () => {
+              if (screenSocket !== socket) return;
+              console.error("[screen-viewer] websocket error");
+              screenState = "error";
+              controlState = "idle";
+              clearHeldInputState();
+              updateScreenStatus("Falha no canal de visualização");
+            });
+            return;
           }
-        } else if (message.type === "control.stop_ack") {
-          console.info("[remote-control] stop ack", { reason: message.reason || "operator_request" });
-          controlState = "idle";
-          controlErrorMessage = message.reason && message.reason !== "operator_request"
-            ? `Encerrado: ${message.reason}` : "";
-          clearHeldInputState();
-          updateScreenStatus(controlErrorMessage || "Controle encerrado");
-        } else if (message.type === "screen.stop_ack") {
-          screenState = "stopped";
-          controlState = "idle";
-          screenRemoteWidth = 0;
-          screenRemoteHeight = 0;
-          clearHeldInputState();
-          updateScreenStatus("Parado");
+          if (["rejected", "expired", "cancelled"].includes(result.status)) {
+            screenConsentRequestId = null;
+            screenState = "error";
+            updateScreenStatus(`Acesso não iniciado: ${result.reason || result.status}`);
+            return;
+          }
+          if (Date.now() >= deadline) {
+            screenConsentRequestId = null;
+            screenState = "error";
+            updateScreenStatus("A solicitação de acesso expirou");
+            return;
+          }
+          screenConsentPollTimer = setTimeout(poll, 500);
+        } catch (error) {
+          if (screenState === "consent") {
+            screenState = "error";
+            updateScreenStatus(error.message);
+          }
         }
-      });
-      socket.addEventListener("close", (event) => {
-        if (screenSocket !== socket) return;
-        console.warn("[screen-viewer] websocket closed", {
-          code: event.code,
-          reason: event.reason || "no_reason",
-        });
-        screenSocket = null;
-        screenComputerId = null;
-        screenState = "stopped";
-        controlState = "idle";
-        clearHeldInputState();
-        updateScreenStatus("Canal de visualização encerrado");
-      });
-      socket.addEventListener("error", () => {
-        if (screenSocket !== socket) return;
-        console.error("[screen-viewer] websocket error");
-        screenState = "error";
-        controlState = "idle";
-        clearHeldInputState();
-        updateScreenStatus("Falha no canal de visualização");
-      });
+      };
+      await poll();
     } catch (error) {
-      screenSocket = null;
-      screenComputerId = null;
-      screenState = "error";
-      updateScreenStatus(error.message);
+      if (screenState === "consent") {
+        screenState = "error";
+        updateScreenStatus(error.message);
+      }
     }
   }
 
   function stopScreenViewer() {
+    if (screenState === "consent" && screenConsentRequestId && screenComputerId !== null) {
+      const computerId = screenComputerId;
+      const requestId = screenConsentRequestId;
+      screenConsentRequestId = null;
+      if (screenConsentPollTimer !== null) clearTimeout(screenConsentPollTimer);
+      screenConsentPollTimer = null;
+      api(`/api/v1/admin/computers/${computerId}/screen/access-request/${encodeURIComponent(requestId)}/cancel`, { method: "POST" }).catch(() => {});
+      screenState = "stopped";
+      updateScreenStatus("Solicitação cancelada");
+      return;
+    }
     if (!screenSocket || screenSocket.readyState !== WebSocket.OPEN) return;
     if (["starting", "streaming"].includes(screenState)) {
       if (["starting", "active"].includes(controlState)) {
@@ -636,6 +682,12 @@
   }
 
   function closeScreenViewer() {
+    if (screenConsentPollTimer !== null) clearTimeout(screenConsentPollTimer);
+    screenConsentPollTimer = null;
+    if (screenConsentRequestId && screenComputerId !== null) {
+      api(`/api/v1/admin/computers/${screenComputerId}/screen/access-request/${encodeURIComponent(screenConsentRequestId)}/cancel`, { method: "POST" }).catch(() => {});
+    }
+    screenConsentRequestId = null;
     const socket = screenSocket;
     releaseHeldInputs();
     screenSocket = null;

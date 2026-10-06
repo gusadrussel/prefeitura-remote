@@ -2,6 +2,7 @@ import base64
 import json
 import tempfile
 import unittest
+from types import SimpleNamespace
 import uuid
 from dataclasses import replace
 from pathlib import Path
@@ -100,27 +101,92 @@ class ScreenApiTests(unittest.TestCase):
         finally:
             session.close()
 
-    def _issue_ticket(self, computer_id):
+    def _issue_consent_request(self, computer_id):
         return self.client.post(
-            f"/api/v1/admin/computers/{computer_id}/screen/viewer-ticket",
+            f"/api/v1/admin/computers/{computer_id}/screen/access-request",
             headers=self.dashboard_headers,
         )
 
-    def test_pending_or_disconnected_machine_cannot_get_viewer_ticket(self):
+    def _issue_ticket(self, computer_id):
+        computer = self.app.state.session_factory()
+        try:
+            row = computer.get(self.app.state.computer_model, computer_id)
+            ticket, expires_in = self.app.state.screen_streams.issue_ticket(row.agent_id, computer_id)
+            return SimpleNamespace(status_code=200, headers={}, json=lambda: {"ticket": ticket, "expires_in": expires_in}, text="")
+        finally:
+            computer.close()
+
+    def test_pending_or_disconnected_machine_cannot_request_remote_access(self):
         _, pending_id = self._register()
-        pending = self._issue_ticket(pending_id)
+        pending = self._issue_consent_request(pending_id)
         self.assertEqual(pending.status_code, 403)
 
         _, authorized_id = self._register("authorized")
-        disconnected = self._issue_ticket(authorized_id)
+        disconnected = self._issue_consent_request(authorized_id)
         self.assertEqual(disconnected.status_code, 409)
         _, revoked_id = self._register("revoked")
-        revoked = self._issue_ticket(revoked_id)
+        revoked = self._issue_consent_request(revoked_id)
         self.assertEqual(revoked.status_code, 403)
         self.assertEqual(
-            self.client.post(f"/api/v1/admin/computers/{authorized_id}/screen/viewer-ticket").status_code,
+            self.client.post(
+                f"/api/v1/admin/computers/{authorized_id}/screen/access-request"
+            ).status_code,
             401,
         )
+
+    def test_remote_access_requires_user_consent_before_ticket(self):
+        agent_id, computer_id = self._register("authorized")
+        with self._agent_socket(agent_id) as agent_socket:
+            agent_socket.send_json({"type": "hello", "agent_id": agent_id, "version": "test"})
+            self.assertEqual(agent_socket.receive_json()["type"], "hello_ack")
+            response = self._issue_consent_request(computer_id)
+            self.assertEqual(response.status_code, 202, response.text)
+            request_id = response.json()["request_id"]
+            command = agent_socket.receive_json()
+            self.assertEqual(command["type"], "session.consent_request")
+            self.assertEqual(command["request_id"], request_id)
+            self.assertEqual(command["technician_name"], "Técnico da TI")
+
+            pending = self.client.get(
+                f"/api/v1/admin/computers/{computer_id}/screen/access-request/{request_id}",
+                headers=self.dashboard_headers,
+            )
+            self.assertEqual(pending.json()["status"], "pending")
+            agent_socket.send_json({"type": "session.consent_response", "request_id": request_id, "accepted": True})
+            result = agent_socket.receive_json()
+            self.assertEqual(result["type"], "session.consent_result")
+            self.assertTrue(result["approved"])
+
+            approved = self.client.get(
+                f"/api/v1/admin/computers/{computer_id}/screen/access-request/{request_id}",
+                headers=self.dashboard_headers,
+            )
+            self.assertEqual(approved.status_code, 200)
+            self.assertEqual(approved.json()["status"], "approved")
+            ticket = approved.json()["ticket"]
+            self.assertTrue(ticket)
+            agent_socket.close()
+
+            consumed_agent = self.app.state.screen_streams.consume_ticket(ticket, computer_id)
+            self.assertEqual(consumed_agent, agent_id)
+
+    def test_user_rejection_does_not_issue_viewer_ticket(self):
+        agent_id, computer_id = self._register("authorized")
+        with self._agent_socket(agent_id) as agent_socket:
+            agent_socket.send_json({"type": "hello", "agent_id": agent_id, "version": "test"})
+            self.assertEqual(agent_socket.receive_json()["type"], "hello_ack")
+            response = self._issue_consent_request(computer_id)
+            request_id = response.json()["request_id"]
+            self.assertEqual(agent_socket.receive_json()["type"], "session.consent_request")
+            agent_socket.send_json({"type": "session.consent_response", "request_id": request_id, "accepted": False})
+            result = agent_socket.receive_json()
+            self.assertFalse(result["approved"])
+            status = self.client.get(
+                f"/api/v1/admin/computers/{computer_id}/screen/access-request/{request_id}",
+                headers=self.dashboard_headers,
+            )
+            self.assertEqual(status.json()["status"], "rejected")
+            self.assertNotIn("ticket", status.json())
 
     def test_pending_machine_cannot_open_control_viewer_with_stale_ticket(self):
         agent_id, computer_id = self._register()
@@ -139,48 +205,33 @@ class ScreenApiTests(unittest.TestCase):
     def test_viewer_ticket_capacity_returns_429_without_evicting_valid_ticket(self):
         first_agent_id, first_computer_id = self._register("authorized")
         second_agent_id, second_computer_id = self._register("authorized")
-        self.app.state.agent_connections.connect(first_agent_id, first_computer_id)
-        self.app.state.agent_connections.connect(second_agent_id, second_computer_id)
-
         with patch("server.services.screen_streams.MAX_PENDING_SCREEN_TICKETS", 1):
-            first_response = self._issue_ticket(first_computer_id)
-            self.assertEqual(first_response.status_code, 200)
-            first_ticket = first_response.json()["ticket"]
-
-            rejected = self._issue_ticket(second_computer_id)
-            self.assertEqual(rejected.status_code, 429)
-            self.assertNotIn("ticket", rejected.json())
-
+            first_ticket, _ = self.app.state.screen_streams.issue_ticket(first_agent_id, first_computer_id)
+            with self.assertRaises(Exception):
+                self.app.state.screen_streams.issue_ticket(second_agent_id, second_computer_id)
             self.assertEqual(
                 self.app.state.screen_streams.consume_ticket(first_ticket, first_computer_id),
                 first_agent_id,
             )
 
-    def test_viewer_ticket_rate_limit_preserves_ticket_and_authorization_checks(self):
+    def test_remote_consent_rate_limit_preserves_authorization_checks(self):
         self.app.state.settings = replace(
             self.settings,
-            viewer_ticket_requests_per_window=1,
+            remote_consent_requests_per_window=1,
             rate_limit_window_seconds=60,
         )
         agent_id, computer_id = self._register("authorized")
         self.app.state.agent_connections.connect(agent_id, computer_id)
 
-        first = self._issue_ticket(computer_id)
-        self.assertEqual(first.status_code, 200)
-        limited = self._issue_ticket(computer_id)
+        first = self._issue_consent_request(computer_id)
+        self.assertEqual(first.status_code, 202)
+        limited = self._issue_consent_request(computer_id)
         self.assertEqual(limited.status_code, 429)
         self.assertIn("retry-after", limited.headers)
-        self.assertEqual(
-            self.app.state.screen_streams.consume_ticket(first.json()["ticket"], computer_id),
-            agent_id,
-        )
 
         pending_agent_id, pending_computer_id = self._register()
-        self.app.state.agent_connections.connect(
-            pending_agent_id,
-            pending_computer_id,
-        )
-        self.assertEqual(self._issue_ticket(pending_computer_id).status_code, 403)
+        self.app.state.agent_connections.connect(pending_agent_id, pending_computer_id)
+        self.assertEqual(self._issue_consent_request(pending_computer_id).status_code, 403)
 
     def test_repeated_viewer_websocket_handshakes_are_limited(self):
         self.app.state.settings = replace(
@@ -377,6 +428,7 @@ class ScreenApiTests(unittest.TestCase):
                     agent_socket.receive_json(),
                     {"type": "session.stop", "reason": "channel_unavailable"},
                 )
+            agent_socket.close()
 
     def test_invalid_jpeg_frame_is_rejected_and_not_forwarded(self):
         class FrameSettings:
