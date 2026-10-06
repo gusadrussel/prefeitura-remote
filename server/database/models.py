@@ -2,7 +2,7 @@
 
 from datetime import datetime
 
-from sqlalchemy import DateTime, Integer, JSON, String, Text, text
+from sqlalchemy import Boolean, DateTime, Integer, JSON, String, Text, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -23,5 +23,9 @@ class Computer(Base):
     last_seen: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     inventory: Mapped[dict] = mapped_column(JSON)
     authorization_status: Mapped[str] = mapped_column(
-        String(20), nullable=False, default="pending", server_default=text("'authorized'")
+        String(20), nullable=False, default="pending", server_default=text("'pending'")
+    )
+    agent_credential_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    agent_credential_revoked: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("FALSE")
     )

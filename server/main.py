@@ -15,6 +15,7 @@ from server.routes.api import router
 from server.routes.screen import screen_router
 from server.routes.websocket import websocket_router
 from server.services.agent_connections import AgentConnectionRegistry
+from server.services.rate_limits import InMemoryRateLimiter
 from server.services.screen_streams import ScreenStreamRegistry
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -30,6 +31,7 @@ def create_app(settings: Settings | None = None, database_url: str | None = None
     app.state.computer_model = Computer
     app.state.agent_connections = AgentConnectionRegistry()
     app.state.screen_streams = ScreenStreamRegistry()
+    app.state.rate_limiter = InMemoryRateLimiter()
     app.include_router(router)
     app.include_router(websocket_router)
     app.include_router(screen_router)

@@ -10,7 +10,9 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from server.database.models import Computer
-from server.routes.websocket import _is_secure_or_loopback
+from server.routes.websocket import _is_secure_or_loopback, _websocket_connection_allowed
+from server.services.agent_credentials import has_active_agent_credential
+from server.services.remote_control import valid_viewer_message
 
 LOGGER = logging.getLogger("prefeitura_remote.screen")
 screen_router = APIRouter()
@@ -26,7 +28,10 @@ def _is_authorized(websocket: WebSocket, computer_id: int, agent_id: str) -> boo
                 Computer.authorization_status == "authorized",
             )
         )
-        return computer is not None
+        return bool(
+            computer is not None
+            and has_active_agent_credential(computer, websocket.app.state.settings)
+        )
     finally:
         session.close()
 
@@ -37,11 +42,16 @@ def _valid_jpeg_frame(message: dict, settings) -> bool:
     height = message.get("height")
     sequence = message.get("sequence")
     if (
-        message.get("format") != "jpeg"
+        set(message) != {"type", "format", "data", "width", "height", "sequence"}
+        or message.get("type") != "screen.frame"
+        or message.get("format") != "jpeg"
         or not isinstance(data, str)
         or not isinstance(width, int)
+        or isinstance(width, bool)
         or not isinstance(height, int)
+        or isinstance(height, bool)
         or not isinstance(sequence, int)
+        or isinstance(sequence, bool)
         or sequence < 0
         or width < 1
         or height < 1
@@ -69,6 +79,9 @@ async def _close(websocket: WebSocket, code: int, reason: str) -> None:
 async def screen_viewer(websocket: WebSocket, computer_id: int) -> None:
     if not _is_secure_or_loopback(websocket):
         await _close(websocket, 1008, "WSS obrigatório fora de localhost")
+        return
+    if not _websocket_connection_allowed(websocket, "viewer", str(computer_id)):
+        await websocket.close(code=1013, reason="Limite de conexões atingido")
         return
 
     ticket = websocket.query_params.get("ticket", "")
@@ -109,7 +122,7 @@ async def screen_viewer(websocket: WebSocket, computer_id: int) -> None:
             if receive_task in done:
                 message = receive_task.result()
                 receive_task = asyncio.create_task(websocket.receive_json())
-                if not isinstance(message, dict):
+                if not valid_viewer_message(message):
                     await _close(websocket, 1003, "Mensagem inválida")
                     break
 
@@ -149,8 +162,20 @@ async def screen_viewer(websocket: WebSocket, computer_id: int) -> None:
                             {"type": "screen.start_ack", "accepted": False, "reason": "agent_busy"},
                         )
                 elif message_type == "screen.stop":
+                    if streams.request_control_stop(viewer):
+                        if not agent_connections.send_urgent(agent_id, {"type": "screen.stop"}):
+                            streams.agent_control_stopped(
+                                agent_id,
+                                {
+                                    "type": "control.stop_ack",
+                                    "stopped": True,
+                                    "reason": "agent_disconnected",
+                                },
+                            )
                     if streams.request_stop(viewer):
-                        if not agent_connections.send(agent_id, {"type": "screen.stop"}):
+                        if viewer.control_state == "idle" and not agent_connections.send_urgent(
+                            agent_id, {"type": "screen.stop"}
+                        ):
                             streams.agent_stopped(
                                 agent_id,
                                 {"type": "screen.stop_ack", "stopped": True},
@@ -159,6 +184,116 @@ async def screen_viewer(websocket: WebSocket, computer_id: int) -> None:
                         streams.publish_control(
                             agent_id, {"type": "screen.stop_ack", "stopped": True}
                         )
+                elif message_type == "control.start":
+                    if not _is_authorized(websocket, computer_id, agent_id):
+                        LOGGER.warning(
+                            "remote_control_start_rejected reason=not_authorized computer_id=%s agent_id=%s",
+                            computer_id,
+                            agent_id,
+                        )
+                        streams.publish_control(
+                            agent_id,
+                            {
+                                "type": "control.start_ack",
+                                "accepted": False,
+                                "reason": "not_authorized",
+                            },
+                        )
+                        continue
+                    current = agent_connections.get(agent_id)
+                    if not current or not current.connected:
+                        LOGGER.warning(
+                            "remote_control_start_rejected reason=agent_disconnected computer_id=%s agent_id=%s",
+                            computer_id,
+                            agent_id,
+                        )
+                        streams.publish_control(
+                            agent_id,
+                            {
+                                "type": "control.start_ack",
+                                "accepted": False,
+                                "reason": "agent_disconnected",
+                            },
+                        )
+                        continue
+                    if not streams.request_control_start(viewer):
+                        reason = (
+                            "screen_not_running"
+                            if viewer.state != "streaming"
+                            else "already_running"
+                        )
+                        LOGGER.warning(
+                            "remote_control_start_rejected reason=%s computer_id=%s agent_id=%s",
+                            reason,
+                            computer_id,
+                            agent_id,
+                        )
+                        streams.publish_control(
+                            agent_id,
+                            {"type": "control.start_ack", "accepted": False, "reason": reason},
+                        )
+                        continue
+                    if not agent_connections.send(agent_id, {"type": "control.start"}):
+                        LOGGER.error(
+                            "remote_control_start_rejected reason=agent_queue_unavailable computer_id=%s agent_id=%s",
+                            computer_id,
+                            agent_id,
+                        )
+                        streams.agent_control_started(
+                            agent_id,
+                            {
+                                "type": "control.start_ack",
+                                "accepted": False,
+                                "reason": "agent_busy",
+                            },
+                        )
+                elif message_type == "control.stop":
+                    if streams.request_control_stop(viewer):
+                        if not agent_connections.send_urgent(agent_id, {"type": "control.stop"}):
+                            streams.agent_control_stopped(
+                                agent_id,
+                                {
+                                    "type": "control.stop_ack",
+                                    "stopped": True,
+                                    "reason": "agent_disconnected",
+                                },
+                            )
+                    else:
+                        if viewer.control_state == "idle":
+                            streams.publish_control(
+                                agent_id, {"type": "control.stop_ack", "stopped": True}
+                            )
+                elif message_type == "control.input":
+                    if not _is_authorized(websocket, computer_id, agent_id):
+                        agent_connections.send_urgent(
+                            agent_id,
+                            {"type": "session.stop", "reason": "channel_unavailable"},
+                        )
+                        streams.agent_disconnected(agent_id)
+                        await _close(websocket, 1008, "Computador não autorizado")
+                        break
+                    current = agent_connections.get(agent_id)
+                    if (
+                        viewer.state != "streaming"
+                        or viewer.control_state != "active"
+                        or not current
+                        or not current.connected
+                    ):
+                        await _close(websocket, 1008, "Sessão de controle inativa")
+                        break
+                    if not agent_connections.send(agent_id, message):
+                        LOGGER.error(
+                            "remote_control_stopped reason=agent_queue_full computer_id=%s agent_id=%s",
+                            computer_id,
+                            agent_id,
+                        )
+                        agent_connections.send_urgent(
+                            agent_id,
+                            {"type": "session.stop", "reason": "authorization_revoked"},
+                        )
+                        streams.agent_disconnected(agent_id)
+                        await _close(websocket, 1011, "Canal do agente indisponível")
+                        break
                 else:
                     await _close(websocket, 1003, "Mensagem não suportada no viewer")
                     break

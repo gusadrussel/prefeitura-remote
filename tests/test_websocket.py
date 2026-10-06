@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -7,6 +8,7 @@ from starlette.websockets import WebSocketDisconnect
 
 from server.config import Settings
 from server.main import create_app
+from server.provision_agent import provision_agent, revoke_agent_credential
 from server.routes.websocket import derive_agent_channel_credential
 
 
@@ -18,6 +20,7 @@ class AgentWebSocketTests(unittest.TestCase):
             database_url=f"sqlite:///{database_path}",
             agent_token="agent-channel-token",
             dashboard_token="dashboard-test-token",
+            allow_legacy_agent_token=True,
             online_threshold_seconds=900,
             agent_heartbeat_interval_seconds=0.02,
             agent_heartbeat_timeout_seconds=0.15,
@@ -32,9 +35,13 @@ class AgentWebSocketTests(unittest.TestCase):
         self.app.state.engine.dispose()
         self.temp_dir.cleanup()
 
-    def _register_agent(self, hostname="WS-TEST"):
+    def _register_agent(
+        self,
+        hostname="WS-TEST",
+        agent_id="c0c0c0c0-1111-4222-8333-123456789abc",
+    ):
         payload = {
-            "agent_id": "c0c0c0c0-1111-4222-8333-123456789abc",
+            "agent_id": agent_id,
             "system": {"hostname": hostname, "os_name": "Linux"},
         }
         response = self.client.post(
@@ -58,6 +65,20 @@ class AgentWebSocketTests(unittest.TestCase):
         return self.client.websocket_connect(
             url, headers={"Authorization": f"Bearer {credential}"}
         )
+
+    def _connect_with_credential(self, agent_id, credential):
+        return self.client.websocket_connect(
+            f"ws://127.0.0.1/ws/agents/{agent_id}",
+            headers={"Authorization": f"Bearer {credential}"},
+        )
+
+    def _issue_individual_credential(self, agent_id):
+        session = self.app.state.session_factory()
+        try:
+            _, credential = provision_agent(session, agent_id)
+            return credential
+        finally:
+            session.close()
 
     def test_pending_and_revoked_agents_are_rejected(self):
         agent_id, computer_id = self._register_agent()
@@ -98,6 +119,19 @@ class AgentWebSocketTests(unittest.TestCase):
                 pass
         with self.assertRaises(WebSocketDisconnect):
             with self._connect(agent_id, host="remote.example.gov"):
+                pass
+        self.assertIsNone(self.app.state.agent_connections.get(agent_id))
+
+    def test_global_agent_token_fallback_requires_explicit_compatibility_flag(self):
+        agent_id, computer_id = self._register_agent()
+        self._authorize(computer_id)
+        self.app.state.settings = replace(
+            self.app.state.settings,
+            allow_legacy_agent_token=False,
+        )
+
+        with self.assertRaises(WebSocketDisconnect):
+            with self._connect(agent_id):
                 pass
         self.assertIsNone(self.app.state.agent_connections.get(agent_id))
 
@@ -165,7 +199,95 @@ class AgentWebSocketTests(unittest.TestCase):
         self.assertIsNotNone(connection)
         self.assertFalse(connection.connected)
 
-    def test_revoking_agent_closes_its_active_session_on_next_heartbeat(self):
+    def test_repeated_agent_websocket_connections_are_limited_per_peer_and_agent(self):
+        self.app.state.settings = replace(
+            self.app.state.settings,
+            websocket_connections_per_window=1,
+            rate_limit_window_seconds=60,
+        )
+        agent_id, computer_id = self._register_agent()
+        self._authorize(computer_id)
+
+        with self._connect(agent_id) as websocket:
+            websocket.send_json({"type": "hello", "agent_id": agent_id, "version": "test"})
+            self.assertEqual(websocket.receive_json()["type"], "hello_ack")
+            websocket.send_json({"type": "disconnect"})
+            self.assertEqual(websocket.receive_json()["type"], "disconnect_ack")
+
+        with self.assertRaises(WebSocketDisconnect):
+            with self._connect(agent_id):
+                pass
+
+    def test_invalid_agent_websocket_credentials_are_limited_per_peer(self):
+        self.app.state.settings = replace(
+            self.app.state.settings,
+            auth_failures_per_window=1,
+            rate_limit_window_seconds=60,
+        )
+        agent_id, computer_id = self._register_agent()
+        self._authorize(computer_id)
+
+        with self.assertRaises(WebSocketDisconnect):
+            with self._connect(agent_id, token="wrong-token"):
+                pass
+        with self.assertRaises(WebSocketDisconnect):
+            with self._connect(agent_id, token="wrong-token"):
+                pass
+
+        failure_window = self.app.state.rate_limiter._windows[
+            "websocket-auth-failure:127.0.0.1"
+        ]
+        self.assertEqual(failure_window.attempts, 1)
+
+        with self._connect(agent_id) as websocket:
+            websocket.send_json({"type": "hello", "agent_id": agent_id, "version": "test"})
+            self.assertEqual(websocket.receive_json()["type"], "hello_ack")
+            websocket.send_json({"type": "disconnect"})
+            self.assertEqual(websocket.receive_json()["type"], "disconnect_ack")
+        self.assertNotIn(
+            "websocket-auth-failure:127.0.0.1",
+            self.app.state.rate_limiter._windows,
+        )
+
+    def test_individual_credential_authenticates_and_revocation_closes_live_channel(self):
+        agent_id, computer_id = self._register_agent()
+        self._authorize(computer_id)
+        credential = self._issue_individual_credential(agent_id)
+
+        with self._connect_with_credential(agent_id, credential) as websocket:
+            websocket.send_json({"type": "hello", "agent_id": agent_id, "version": "test"})
+            self.assertEqual(websocket.receive_json()["type"], "hello_ack")
+            session = self.app.state.session_factory()
+            try:
+                self.assertTrue(revoke_agent_credential(session, agent_id))
+            finally:
+                session.close()
+            websocket.send_json({"type": "heartbeat"})
+            with self.assertRaises(WebSocketDisconnect) as closed:
+                websocket.receive_json()
+        self.assertEqual(closed.exception.code, 1008)
+        self.assertFalse(self.app.state.agent_connections.get(agent_id).connected)
+
+    def test_individual_credential_cannot_impersonate_another_agent(self):
+        first_agent, first_computer = self._register_agent(
+            hostname="WS-FIRST",
+            agent_id="c0c0c0c0-1111-4222-8333-123456789abc",
+        )
+        second_agent, second_computer = self._register_agent(
+            hostname="WS-SECOND",
+            agent_id="d0d0d0d0-1111-4222-8333-123456789abc",
+        )
+        self._authorize(first_computer)
+        self._authorize(second_computer)
+        first_credential = self._issue_individual_credential(first_agent)
+        self._issue_individual_credential(second_agent)
+
+        with self.assertRaises(WebSocketDisconnect):
+            with self._connect_with_credential(second_agent, first_credential):
+                pass
+        self.assertIsNone(self.app.state.agent_connections.get(second_agent))
+
+    def test_revoking_agent_sends_immediate_session_stop(self):
         agent_id, computer_id = self._register_agent()
         self._authorize(computer_id)
         with self._connect(agent_id) as websocket:
@@ -176,10 +298,12 @@ class AgentWebSocketTests(unittest.TestCase):
                 headers=self.dashboard_headers,
             )
             self.assertEqual(revoked.status_code, 200)
-            websocket.send_json({"type": "heartbeat"})
-            with self.assertRaises(WebSocketDisconnect) as closed:
-                websocket.receive_json()
-        self.assertEqual(closed.exception.code, 1008)
+            self.assertEqual(
+                websocket.receive_json(),
+                {"type": "session.stop", "reason": "authorization_revoked"},
+            )
+            websocket.send_json({"type": "disconnect"})
+            self.assertEqual(websocket.receive_json()["type"], "disconnect_ack")
         self.assertFalse(self.app.state.agent_connections.get(agent_id).connected)
 
     def test_unsupported_control_messages_are_not_implemented(self):

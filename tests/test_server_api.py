@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -8,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from server.config import Settings
 from server.main import create_app
+from server.provision_agent import provision_agent, revoke_agent_credential
 from server.services.inventory import is_authorized, is_online
 
 
@@ -19,12 +21,16 @@ class InventoryApiTests(unittest.TestCase):
             database_url=f"sqlite:///{database_path}",
             agent_token="agent-test-token",
             dashboard_token="dashboard-test-token",
+            allow_legacy_agent_token=True,
             online_threshold_seconds=900,
         )
-        self.client = TestClient(create_app(settings))
+        self.settings = settings
+        self.app = create_app(settings)
+        self.client = TestClient(self.app)
 
     def tearDown(self):
         self.client.close()
+        self.app.state.engine.dispose()
         self.temp_dir.cleanup()
 
     def test_health_and_dashboard_are_served(self):
@@ -171,6 +177,128 @@ class InventoryApiTests(unittest.TestCase):
 
     def test_dashboard_queries_require_a_token(self):
         self.assertEqual(self.client.get("/api/v1/computers").status_code, 401)
+
+    def test_authentication_failures_are_limited_and_valid_auth_resets_counter(self):
+        self.app.state.settings = replace(
+            self.settings,
+            auth_failures_per_window=2,
+            rate_limit_window_seconds=60,
+        )
+        for _ in range(2):
+            self.assertEqual(self.client.get("/api/v1/admin/computers").status_code, 401)
+        limited = self.client.get("/api/v1/admin/computers")
+        self.assertEqual(limited.status_code, 429)
+        self.assertEqual(limited.headers["retry-after"], "60")
+
+        dashboard_headers = {"Authorization": "Bearer dashboard-test-token"}
+        self.assertEqual(
+            self.client.get("/api/v1/admin/computers", headers=dashboard_headers).status_code,
+            200,
+        )
+        self.assertEqual(self.client.get("/api/v1/admin/computers").status_code, 401)
+
+    def test_valid_inventory_updates_are_limited_per_agent_without_mutating_on_429(self):
+        self.app.state.settings = replace(
+            self.settings,
+            inventory_updates_per_window=1,
+            rate_limit_window_seconds=60,
+        )
+        inventory = {
+            "agent_id": "d1d1d1d1-1111-4222-8333-123456789abc",
+            "system": {"hostname": "RATE-LIMIT-01"},
+        }
+        headers = {"Authorization": "Bearer agent-test-token"}
+        first = self.client.post("/api/v1/inventory", json=inventory, headers=headers)
+        self.assertEqual(first.status_code, 201)
+
+        inventory["system"]["hostname"] = "RATE-LIMIT-CHANGED"
+        limited = self.client.post("/api/v1/inventory", json=inventory, headers=headers)
+        self.assertEqual(limited.status_code, 429)
+        self.assertEqual(limited.headers["retry-after"], "60")
+
+        detail = self.client.get(
+            f"/api/v1/admin/computers/{first.json()['computer_id']}",
+            headers={"Authorization": "Bearer dashboard-test-token"},
+        )
+        self.assertEqual(detail.json()["computer"]["hostname"], "RATE-LIMIT-01")
+
+    def test_inventory_uses_individual_credential_and_refuses_impersonation_or_revocation(self):
+        self.app.state.settings = replace(self.settings, allow_legacy_agent_token=False)
+        agent_one = "e1e1e1e1-1111-4222-8333-123456789abc"
+        agent_two = "e2e2e2e2-1111-4222-8333-123456789abc"
+        session = self.app.state.session_factory()
+        try:
+            _, credential_one = provision_agent(session, agent_one)
+            _, credential_two = provision_agent(session, agent_two)
+        finally:
+            session.close()
+
+        payload = {"agent_id": agent_one, "system": {"hostname": "INDIVIDUAL-01"}}
+        accepted = self.client.post(
+            "/api/v1/inventory",
+            json=payload,
+            headers={"Authorization": f"Bearer {credential_one}"},
+        )
+        self.assertEqual(accepted.status_code, 201)
+
+        spoofed = self.client.post(
+            "/api/v1/inventory",
+            json={**payload, "agent_id": agent_two},
+            headers={"Authorization": f"Bearer {credential_one}"},
+        )
+        self.assertEqual(spoofed.status_code, 401)
+        self.assertEqual(
+            self.client.post(
+                "/api/v1/inventory",
+                json=payload,
+                headers={"Authorization": "Bearer agent-test-token"},
+            ).status_code,
+            401,
+        )
+
+        session = self.app.state.session_factory()
+        try:
+            self.assertTrue(revoke_agent_credential(session, agent_one))
+        finally:
+            session.close()
+        revoked = self.client.post(
+            "/api/v1/inventory",
+            json=payload,
+            headers={"Authorization": f"Bearer {credential_one}"},
+        )
+        self.assertEqual(revoked.status_code, 401)
+        self.assertNotEqual(credential_one, credential_two)
+
+    def test_authorization_change_limit_does_not_apply_the_blocked_change(self):
+        self.app.state.settings = replace(
+            self.settings,
+            authorization_changes_per_window=1,
+            rate_limit_window_seconds=60,
+        )
+        payload = {
+            "agent_id": "c1c1c1c1-1111-4222-8333-123456789abc",
+            "system": {"hostname": "RATE-LIMIT-TEST"},
+        }
+        created = self.client.post(
+            "/api/v1/inventory",
+            json=payload,
+            headers={"Authorization": "Bearer agent-test-token"},
+        )
+        computer_id = created.json()["computer_id"]
+        headers = {"Authorization": "Bearer dashboard-test-token"}
+        authorized = self.client.post(
+            f"/api/v1/admin/computers/{computer_id}/authorize", headers=headers
+        )
+        self.assertEqual(authorized.status_code, 200)
+
+        rejected = self.client.post(
+            f"/api/v1/admin/computers/{computer_id}/revoke", headers=headers
+        )
+        self.assertEqual(rejected.status_code, 429)
+        detail = self.client.get(
+            f"/api/v1/admin/computers/{computer_id}", headers=headers
+        )
+        self.assertEqual(detail.json()["computer"]["authorization_status"], "authorized")
 
     def test_online_status_uses_the_configured_heartbeat_window(self):
         now = datetime(2026, 9, 29, 12, tzinfo=UTC)

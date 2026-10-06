@@ -26,6 +26,23 @@ class AgentConnectionRegistryTests(unittest.TestCase):
         self.assertTrue(registry.get("agent-1").connected)
         self.assertEqual(registry.get("agent-1").connection_id, second.connection_id)
 
+    def test_urgent_command_replaces_queued_controls(self):
+        registry = AgentConnectionRegistry()
+        connection = registry.connect("agent-1", 42)
+        for index in range(connection.outbound.maxsize):
+            self.assertTrue(registry.send("agent-1", {"type": "control.input", "index": index}))
+
+        self.assertTrue(
+            registry.send_urgent(
+                "agent-1", {"type": "session.stop", "reason": "authorization_revoked"}
+            )
+        )
+        self.assertEqual(
+            connection.outbound.get_nowait(),
+            {"type": "session.stop", "reason": "authorization_revoked"},
+        )
+        self.assertTrue(connection.outbound.empty())
+
 
 if __name__ == "__main__":
     unittest.main()

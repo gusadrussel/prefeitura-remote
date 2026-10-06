@@ -67,6 +67,10 @@ class ScreenCapture:
         self._quality = quality
         self._max_bytes = max_bytes
 
+    @property
+    def screen_size(self) -> tuple[int, int]:
+        return int(self._monitor["width"]), int(self._monitor["height"])
+
     def capture_jpeg(self) -> tuple[bytes, int, int]:
         screenshot = self._capture.grab(self._monitor)
         return encode_rgb_frame(

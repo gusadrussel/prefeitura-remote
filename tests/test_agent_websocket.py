@@ -91,6 +91,38 @@ class AgentWebSocketClientTests(unittest.TestCase):
         sent_messages = [json.loads(call.args[0])["type"] for call in fake_connection.send.call_args_list]
         self.assertEqual(sent_messages, ["hello", "heartbeat", "disconnect"])
 
+    def test_client_sends_individual_credential_without_global_hmac_derivation(self):
+        stop_event = threading.Event()
+        fake_connection = MagicMock()
+        fake_connection.__enter__.return_value = fake_connection
+        fake_connection.recv.side_effect = [
+            json.dumps({"type": "hello_ack", "agent_id": "agent-1", "heartbeat_interval": 1}),
+            json.dumps({"type": "heartbeat_ack"}),
+            json.dumps({"type": "disconnect_ack"}),
+        ]
+
+        def record_message(message):
+            if json.loads(message)["type"] == "heartbeat":
+                stop_event.set()
+
+        fake_connection.send.side_effect = record_message
+        individual_credential = "per-agent-random-secret-value"
+        with patch("agent.connection.connect", return_value=fake_connection) as connect:
+            run_websocket_session(
+                "https://central.example.gov",
+                "agent-1",
+                individual_credential,
+                300,
+                lambda: None,
+                stop_event=stop_event,
+                individual_credential=True,
+            )
+
+        self.assertEqual(
+            connect.call_args.kwargs["additional_headers"]["Authorization"],
+            f"Bearer {individual_credential}",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

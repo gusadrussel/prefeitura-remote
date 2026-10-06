@@ -18,18 +18,38 @@ from server.services.inventory import (
     set_authorization_status,
     upsert_inventory,
 )
+from server.services.rate_limits import peer_address
+from server.services.agent_credentials import has_active_agent_credential, verify_agent_credential
+from server.services.screen_streams import ScreenTicketCapacityError
 
 LOGGER = logging.getLogger("prefeitura_remote.server")
 router = APIRouter()
 
 
 def authorize(expected_token: str, label: str) -> Callable:
-    def check_token(authorization: str | None = Header(default=None)) -> None:
+    def check_token(
+        request: Request,
+        authorization: str | None = Header(default=None),
+    ) -> None:
         if not expected_token:
             raise HTTPException(status_code=503, detail=f"Autenticação {label} não configurada")
         provided = authorization.removeprefix("Bearer ").strip() if authorization else ""
-        if not hmac.compare_digest(provided, expected_token):
-            raise HTTPException(status_code=401, detail="Credencial inválida")
+        key = f"auth-failure:{label}:{peer_address(request.client)}"
+        if hmac.compare_digest(provided, expected_token):
+            request.app.state.rate_limiter.reset(key)
+            return
+        settings = request.app.state.settings
+        if not request.app.state.rate_limiter.allow(
+            key,
+            limit=settings.auth_failures_per_window,
+            window_seconds=settings.rate_limit_window_seconds,
+        ):
+            raise HTTPException(
+                status_code=429,
+                detail="Muitas falhas de autenticação; tente novamente mais tarde",
+                headers={"Retry-After": str(settings.rate_limit_window_seconds)},
+            )
+        raise HTTPException(status_code=401, detail="Credencial inválida")
 
     return check_token
 
@@ -42,21 +62,73 @@ def get_session(request: Request):
         session.close()
 
 
-def agent_auth(request: Request, authorization: str | None = Header(default=None)) -> None:
-    authorize(request.app.state.settings.agent_token, "do agente")(authorization)
-
-
 def dashboard_auth(request: Request, authorization: str | None = Header(default=None)) -> None:
-    authorize(request.app.state.settings.dashboard_token, "do painel")(authorization)
+    authorize(request.app.state.settings.dashboard_token, "do painel")(request, authorization)
 
 
 @router.post("/api/v1/inventory", response_model=InventoryAccepted, status_code=201)
 def receive_inventory(
     payload: InventoryPayload,
     request: Request,
-    _authorized: None = Depends(agent_auth),
+    authorization: str | None = Header(default=None),
     session: Session = Depends(get_session),
 ):
+    settings = request.app.state.settings
+    auth_key = f"auth-failure:do agente:{peer_address(request.client)}"
+    scheme, separator, provided = (authorization or "").partition(" ")
+    provided = provided.strip() if separator and scheme.lower() == "bearer" else ""
+    computer = session.scalar(
+        select(request.app.state.computer_model).where(
+            request.app.state.computer_model.agent_id == payload.agent_id
+        )
+    )
+    has_individual_credential = bool(
+        computer
+        and (computer.agent_credential_hash is not None or computer.agent_credential_revoked)
+    )
+    individual_valid = bool(
+        computer
+        and not computer.agent_credential_revoked
+        and verify_agent_credential(provided, computer.agent_credential_hash)
+    )
+    legacy_valid = bool(
+        not has_individual_credential
+        and settings.allow_legacy_agent_token
+        and settings.agent_token
+        and hmac.compare_digest(provided, settings.agent_token)
+    )
+    if individual_valid or legacy_valid:
+        request.app.state.rate_limiter.reset(auth_key)
+    if not individual_valid and not legacy_valid:
+        if (
+            not has_individual_credential
+            and not settings.agent_token
+            and not settings.allow_legacy_agent_token
+        ):
+            raise HTTPException(status_code=503, detail="Autenticação do agente não configurada")
+        if not request.app.state.rate_limiter.allow(
+            auth_key,
+            limit=settings.auth_failures_per_window,
+            window_seconds=settings.rate_limit_window_seconds,
+        ):
+            raise HTTPException(
+                status_code=429,
+                detail="Muitas falhas de autenticação; tente novamente mais tarde",
+                headers={"Retry-After": str(settings.rate_limit_window_seconds)},
+            )
+        raise HTTPException(status_code=401, detail="Credencial inválida")
+
+    rate_key = f"inventory:{peer_address(request.client)}:{payload.agent_id}"
+    if not request.app.state.rate_limiter.allow(
+        rate_key,
+        limit=settings.inventory_updates_per_window,
+        window_seconds=settings.rate_limit_window_seconds,
+    ):
+        raise HTTPException(
+            status_code=429,
+            detail="Muitas atualizações de inventário para este agente",
+            headers={"Retry-After": str(settings.rate_limit_window_seconds)},
+        )
     inventory = payload.model_dump()
     try:
         computer = upsert_inventory(session, inventory)
@@ -152,14 +224,35 @@ def create_screen_viewer_ticket(
     computer = session.get(request.app.state.computer_model, computer_id)
     if computer is None:
         raise HTTPException(status_code=404, detail="Computador não encontrado")
-    if computer.authorization_status != "authorized":
+    if (
+        computer.authorization_status != "authorized"
+        or not has_active_agent_credential(computer, request.app.state.settings)
+    ):
         raise HTTPException(status_code=403, detail="Computador não autorizado")
     connection = request.app.state.agent_connections.get(computer.agent_id)
     if not connection or not connection.connected or connection.computer_id != computer.id:
         raise HTTPException(status_code=409, detail="Agente não conectado ao canal")
-    ticket, expires_in = request.app.state.screen_streams.issue_ticket(
-        computer.agent_id, computer.id
-    )
+    settings = request.app.state.settings
+    rate_key = f"viewer-ticket:{peer_address(request.client)}:{computer.id}"
+    if not request.app.state.rate_limiter.allow(
+        rate_key,
+        limit=settings.viewer_ticket_requests_per_window,
+        window_seconds=settings.rate_limit_window_seconds,
+    ):
+        raise HTTPException(
+            status_code=429,
+            detail="Muitas solicitações de visualização para este computador",
+            headers={"Retry-After": str(settings.rate_limit_window_seconds)},
+        )
+    try:
+        ticket, expires_in = request.app.state.screen_streams.issue_ticket(
+            computer.agent_id, computer.id
+        )
+    except ScreenTicketCapacityError:
+        raise HTTPException(
+            status_code=429,
+            detail="Limite de solicitações de visualização atingido; tente novamente mais tarde",
+        ) from None
     return {"ticket": ticket, "expires_in": expires_in}
 
 
@@ -169,6 +262,18 @@ def _update_authorization(
     status: AuthorizationStatus,
     request: Request,
 ) -> dict:
+    settings = request.app.state.settings
+    rate_key = f"authorization-change:{peer_address(request.client)}:{computer_id}"
+    if not request.app.state.rate_limiter.allow(
+        rate_key,
+        limit=settings.authorization_changes_per_window,
+        window_seconds=settings.rate_limit_window_seconds,
+    ):
+        raise HTTPException(
+            status_code=429,
+            detail="Muitas alterações de autorização para este computador",
+            headers={"Retry-After": str(settings.rate_limit_window_seconds)},
+        )
     try:
         computer = set_authorization_status(session, computer_id, status)
     except SQLAlchemyError:
@@ -182,6 +287,12 @@ def _update_authorization(
         computer.agent_id,
         computer.authorization_status,
     )
+    if computer.authorization_status != "authorized":
+        request.app.state.agent_connections.send_urgent(
+            computer.agent_id,
+            {"type": "session.stop", "reason": "authorization_revoked"},
+        )
+        request.app.state.screen_streams.agent_disconnected(computer.agent_id)
     return computer_summary(
         computer,
         request.app.state.settings.online_threshold_seconds,

@@ -3,17 +3,20 @@ import json
 import tempfile
 import unittest
 import uuid
+from dataclasses import replace
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 from PIL import Image
 from starlette.websockets import WebSocketDisconnect
+from unittest.mock import patch
 
 from agent.connection import derive_channel_credential
 from agent.screen_capture import encode_rgb_frame
 from server.config import Settings
 from server.main import create_app
 from server.routes.websocket import _valid_screen_frame
+from server.provision_agent import provision_agent, revoke_agent_credential
 
 
 class ScreenApiTests(unittest.TestCase):
@@ -24,6 +27,7 @@ class ScreenApiTests(unittest.TestCase):
             database_url=f"sqlite:///{database_path}",
             agent_token="agent-screen-token",
             dashboard_token="dashboard-screen-token",
+            allow_legacy_agent_token=True,
             online_threshold_seconds=900,
             agent_heartbeat_interval_seconds=0.05,
             agent_heartbeat_timeout_seconds=5,
@@ -82,6 +86,20 @@ class ScreenApiTests(unittest.TestCase):
             headers={"Authorization": f"Bearer {credential}"},
         )
 
+    def _individual_agent_socket(self, agent_id, credential):
+        return self.client.websocket_connect(
+            f"ws://127.0.0.1/ws/agents/{agent_id}",
+            headers={"Authorization": f"Bearer {credential}"},
+        )
+
+    def _provision_agent_credential(self, agent_id):
+        session = self.app.state.session_factory()
+        try:
+            _, credential = provision_agent(session, agent_id)
+            return credential
+        finally:
+            session.close()
+
     def _issue_ticket(self, computer_id):
         return self.client.post(
             f"/api/v1/admin/computers/{computer_id}/screen/viewer-ticket",
@@ -103,6 +121,90 @@ class ScreenApiTests(unittest.TestCase):
             self.client.post(f"/api/v1/admin/computers/{authorized_id}/screen/viewer-ticket").status_code,
             401,
         )
+
+    def test_pending_machine_cannot_open_control_viewer_with_stale_ticket(self):
+        agent_id, computer_id = self._register()
+        connection = self.app.state.agent_connections.connect(agent_id, computer_id)
+        ticket, _ = self.app.state.screen_streams.issue_ticket(agent_id, computer_id)
+
+        with self.assertRaises(WebSocketDisconnect):
+            with self.client.websocket_connect(
+                f"ws://127.0.0.1/ws/admin/computers/{computer_id}/screen?ticket={ticket}"
+            ):
+                pass
+
+        self.assertIsNone(self.app.state.screen_streams.get(agent_id))
+        self.assertTrue(connection.outbound.empty())
+
+    def test_viewer_ticket_capacity_returns_429_without_evicting_valid_ticket(self):
+        first_agent_id, first_computer_id = self._register("authorized")
+        second_agent_id, second_computer_id = self._register("authorized")
+        self.app.state.agent_connections.connect(first_agent_id, first_computer_id)
+        self.app.state.agent_connections.connect(second_agent_id, second_computer_id)
+
+        with patch("server.services.screen_streams.MAX_PENDING_SCREEN_TICKETS", 1):
+            first_response = self._issue_ticket(first_computer_id)
+            self.assertEqual(first_response.status_code, 200)
+            first_ticket = first_response.json()["ticket"]
+
+            rejected = self._issue_ticket(second_computer_id)
+            self.assertEqual(rejected.status_code, 429)
+            self.assertNotIn("ticket", rejected.json())
+
+            self.assertEqual(
+                self.app.state.screen_streams.consume_ticket(first_ticket, first_computer_id),
+                first_agent_id,
+            )
+
+    def test_viewer_ticket_rate_limit_preserves_ticket_and_authorization_checks(self):
+        self.app.state.settings = replace(
+            self.settings,
+            viewer_ticket_requests_per_window=1,
+            rate_limit_window_seconds=60,
+        )
+        agent_id, computer_id = self._register("authorized")
+        self.app.state.agent_connections.connect(agent_id, computer_id)
+
+        first = self._issue_ticket(computer_id)
+        self.assertEqual(first.status_code, 200)
+        limited = self._issue_ticket(computer_id)
+        self.assertEqual(limited.status_code, 429)
+        self.assertIn("retry-after", limited.headers)
+        self.assertEqual(
+            self.app.state.screen_streams.consume_ticket(first.json()["ticket"], computer_id),
+            agent_id,
+        )
+
+        pending_agent_id, pending_computer_id = self._register()
+        self.app.state.agent_connections.connect(
+            pending_agent_id,
+            pending_computer_id,
+        )
+        self.assertEqual(self._issue_ticket(pending_computer_id).status_code, 403)
+
+    def test_repeated_viewer_websocket_handshakes_are_limited(self):
+        self.app.state.settings = replace(
+            self.settings,
+            websocket_connections_per_window=1,
+            rate_limit_window_seconds=60,
+        )
+        agent_id, computer_id = self._register("authorized")
+        self.app.state.agent_connections.connect(agent_id, computer_id)
+
+        first_ticket = self._issue_ticket(computer_id)
+        self.assertEqual(first_ticket.status_code, 200)
+        with self.client.websocket_connect(
+            f"ws://127.0.0.1/ws/admin/computers/{computer_id}/screen?ticket={first_ticket.json()['ticket']}"
+        ) as viewer_socket:
+            viewer_socket.close()
+
+        second_ticket = self._issue_ticket(computer_id)
+        self.assertEqual(second_ticket.status_code, 200)
+        with self.assertRaises(WebSocketDisconnect):
+            with self.client.websocket_connect(
+                f"ws://127.0.0.1/ws/admin/computers/{computer_id}/screen?ticket={second_ticket.json()['ticket']}"
+            ):
+                pass
 
     def test_authorized_viewer_ticket_and_explicit_start_stop_protocol(self):
         agent_id, computer_id = self._register("authorized")
@@ -138,6 +240,144 @@ class ScreenApiTests(unittest.TestCase):
         self.assertEqual(viewer.state, "idle")
         self.assertEqual(viewer.control_queue.get_nowait(), stop_ack)
 
+    def test_control_requires_streaming_and_forwards_only_active_input(self):
+        agent_id, computer_id = self._register("authorized")
+        with self._agent_socket(agent_id) as agent_socket:
+            agent_socket.send_json({"type": "hello", "agent_id": agent_id, "version": "test"})
+            self.assertEqual(agent_socket.receive_json()["type"], "hello_ack")
+            ticket_response = self._issue_ticket(computer_id)
+            self.assertEqual(ticket_response.status_code, 200)
+            ticket = ticket_response.json()["ticket"]
+            with self.client.websocket_connect(
+                f"ws://127.0.0.1/ws/admin/computers/{computer_id}/screen?ticket={ticket}"
+            ) as viewer_socket:
+                viewer_socket.send_json({"type": "control.start"})
+                refused = viewer_socket.receive_json()
+                self.assertEqual(refused["type"], "control.start_ack")
+                self.assertFalse(refused["accepted"])
+                self.assertEqual(refused["reason"], "screen_not_running")
+
+                viewer_socket.send_json(
+                    {"type": "control.input", "action": "key.down", "key": "ctrl"}
+                )
+                with self.assertRaises(WebSocketDisconnect):
+                    viewer_socket.receive_json()
+            agent_socket.send_json({"type": "disconnect"})
+            self.assertEqual(agent_socket.receive_json()["type"], "disconnect_ack")
+
+    def test_control_round_trip_and_revocation_terminate_session(self):
+        agent_id, computer_id = self._register("authorized")
+        with self._agent_socket(agent_id) as agent_socket:
+            agent_socket.send_json({"type": "hello", "agent_id": agent_id, "version": "test"})
+            self.assertEqual(agent_socket.receive_json()["type"], "hello_ack")
+            ticket_response = self._issue_ticket(computer_id)
+            self.assertEqual(ticket_response.status_code, 200)
+            ticket = ticket_response.json()["ticket"]
+            with self.client.websocket_connect(
+                f"ws://127.0.0.1/ws/admin/computers/{computer_id}/screen?ticket={ticket}"
+            ) as viewer_socket:
+                viewer_socket.send_json({"type": "screen.start"})
+                self.assertEqual(agent_socket.receive_json()["type"], "screen.start")
+                agent_socket.send_json(
+                    {
+                        "type": "screen.start_ack",
+                        "accepted": True,
+                        "width": 640,
+                        "height": 360,
+                        "screen_width": 1920,
+                        "screen_height": 1080,
+                        "max_fps": 3,
+                    }
+                )
+                self.assertTrue(viewer_socket.receive_json()["accepted"])
+
+                viewer_socket.send_json({"type": "control.start"})
+                self.assertEqual(agent_socket.receive_json(), {"type": "control.start"})
+                agent_socket.send_json(
+                    {
+                        "type": "control.start_ack",
+                        "accepted": True,
+                        "screen_width": 1920,
+                        "screen_height": 1080,
+                    }
+                )
+                self.assertTrue(viewer_socket.receive_json()["accepted"])
+                input_message = {
+                    "type": "control.input",
+                    "action": "pointer.move",
+                    "x": 0.25,
+                    "y": 0.75,
+                }
+                viewer_socket.send_json(input_message)
+                self.assertEqual(agent_socket.receive_json(), input_message)
+
+                revoked = self.client.post(
+                    f"/api/v1/admin/computers/{computer_id}/revoke",
+                    headers=self.dashboard_headers,
+                )
+                self.assertEqual(revoked.status_code, 200)
+                self.assertEqual(
+                    agent_socket.receive_json(),
+                    {"type": "session.stop", "reason": "authorization_revoked"},
+                )
+                agent_socket.send_json({"type": "disconnect"})
+                self.assertEqual(agent_socket.receive_json()["type"], "disconnect_ack")
+                with self.assertRaises(WebSocketDisconnect):
+                    viewer_socket.receive_json()
+
+    def test_individual_credential_revocation_stops_existing_viewer_control(self):
+        agent_id, computer_id = self._register("authorized")
+        individual_credential = self._provision_agent_credential(agent_id)
+        with self._individual_agent_socket(agent_id, individual_credential) as agent_socket:
+            agent_socket.send_json({"type": "hello", "agent_id": agent_id, "version": "test"})
+            self.assertEqual(agent_socket.receive_json()["type"], "hello_ack")
+            ticket_response = self._issue_ticket(computer_id)
+            self.assertEqual(ticket_response.status_code, 200)
+            ticket = ticket_response.json()["ticket"]
+            with self.client.websocket_connect(
+                f"ws://127.0.0.1/ws/admin/computers/{computer_id}/screen?ticket={ticket}"
+            ) as viewer_socket:
+                viewer_socket.send_json({"type": "screen.start"})
+                self.assertEqual(agent_socket.receive_json()["type"], "screen.start")
+                agent_socket.send_json(
+                    {
+                        "type": "screen.start_ack",
+                        "accepted": True,
+                        "width": 640,
+                        "height": 360,
+                        "screen_width": 1920,
+                        "screen_height": 1080,
+                        "max_fps": 3,
+                    }
+                )
+                self.assertTrue(viewer_socket.receive_json()["accepted"])
+                viewer_socket.send_json({"type": "control.start"})
+                self.assertEqual(agent_socket.receive_json(), {"type": "control.start"})
+                agent_socket.send_json(
+                    {
+                        "type": "control.start_ack",
+                        "accepted": True,
+                        "screen_width": 1920,
+                        "screen_height": 1080,
+                    }
+                )
+                self.assertTrue(viewer_socket.receive_json()["accepted"])
+
+                session = self.app.state.session_factory()
+                try:
+                    self.assertTrue(revoke_agent_credential(session, agent_id))
+                finally:
+                    session.close()
+                viewer_socket.send_json(
+                    {"type": "control.input", "action": "key.down", "key": "ctrl"}
+                )
+                with self.assertRaises(WebSocketDisconnect):
+                    viewer_socket.receive_json()
+                self.assertEqual(
+                    agent_socket.receive_json(),
+                    {"type": "session.stop", "reason": "channel_unavailable"},
+                )
+
     def test_invalid_jpeg_frame_is_rejected_and_not_forwarded(self):
         class FrameSettings:
             screen_max_width = 1280
@@ -154,6 +394,8 @@ class ScreenApiTests(unittest.TestCase):
             "sequence": 1,
         }
         self.assertTrue(_valid_screen_frame(valid_message, FrameSettings()))
+        self.assertFalse(_valid_screen_frame({**valid_message, "unexpected": True}, FrameSettings()))
+        self.assertFalse(_valid_screen_frame({**valid_message, "sequence": True}, FrameSettings()))
         invalid_message = {**valid_message, "data": base64.b64encode(b"not-a-jpeg").decode("ascii")}
         self.assertFalse(_valid_screen_frame(invalid_message, FrameSettings()))
         oversized = {**valid_message, "width": 1281}

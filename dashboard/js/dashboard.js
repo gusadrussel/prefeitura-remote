@@ -19,6 +19,17 @@
   let screenState = "idle";
   let screenFrameData = null;
   let screenLastFrameAt = null;
+  let screenRenderSequence = 0;
+  let controlState = "idle";
+  let controlErrorMessage = "";
+  let screenRemoteWidth = 0;
+  let screenRemoteHeight = 0;
+  const controlKeysDown = new Set();
+  const controlButtonsDown = new Set();
+  let lastControlPointer = { x: 0.5, y: 0.5 };
+  let lastPointerMoveAt = 0;
+  let pendingPointerMove = null;
+  let pointerMoveTimer = null;
 
   const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
@@ -42,6 +53,7 @@
   const authHeaders = () => ({ Authorization: `Bearer ${token()}` });
 
   function showLogin(message = "") {
+    if (screenComputerId !== null) closeScreenViewer();
     appView.classList.add("hidden");
     loginPanel.classList.remove("hidden");
     logoutButton.classList.add("hidden");
@@ -171,6 +183,8 @@
       : `<button class="authorization-button" type="button" data-authorization-action="authorize">${computer.authorization_status === "revoked" ? "Reautorizar" : "Autorizar"}</button>`;
     const canStartScreen = computer.authorization_status === "authorized" && computer.channel_connected;
     const screenBusy = screenState === "connecting" || screenState === "starting" || screenState === "streaming" || screenState === "stopping";
+    const canStartControl = canStartScreen && screenState === "streaming"
+      && ["idle", "error"].includes(controlState);
     const screenFrame = screenFrameData
       ? `<img class="screen-frame" src="data:image/jpeg;base64,${screenFrameData}" alt="Tela de ${escapeHtml(computer.hostname)}">`
       : `<div class="screen-placeholder">Aguardando início da visualização</div>`;
@@ -199,7 +213,7 @@
       ${section("ARMAZENAMENTO", (disks || `<div class="hardware-item"><span>Nenhum disco identificado.</span></div>`) + (volumes || ""))}
       ${gpus ? section("VÍDEO", gpus) : ""}
       ${section("PLACA-MÃE E BIOS", detailRow("Fabricante", board.manufacturer) + detailRow("Modelo", board.model) + detailRow("Serial placa-mãe", board.serial) + detailRow("BIOS", bios.version) + detailRow("Serial BIOS", bios.serial))}
-      ${section("VISUALIZAÇÃO DA TELA", `<div class="screen-meta"><span>Máquina: <strong>${escapeHtml(computer.hostname)}</strong></span><span>Canal: <strong>${computer.channel_connected ? "Conectado" : "Desconectado"}</strong></span><span>Transmissão: <strong data-screen-status>${escapeHtml(screenStateLabel())}</strong></span><span>Último frame: <strong data-screen-last-frame>${escapeHtml(formatTime(screenLastFrameAt))}</strong></span></div><div class="screen-actions"><button class="screen-button" type="button" data-screen-action="start" ${!canStartScreen || screenBusy ? "disabled" : ""}>Iniciar visualização</button><button class="screen-button screen-stop-button" type="button" data-screen-action="stop" ${!screenBusy || screenState === "connecting" ? "disabled" : ""}>Parar</button></div><div class="screen-frame-wrap" data-screen-frame>${screenFrame}</div><p class="screen-hint">A transmissão só começa após solicitação do técnico.</p>`)}
+      ${section("VISUALIZAÇÃO DA TELA", `<div class="screen-meta"><span>Máquina: <strong>${escapeHtml(computer.hostname)}</strong></span><span>Canal: <strong>${computer.channel_connected ? "Conectado" : "Desconectado"}</strong></span><span>Transmissão: <strong data-screen-status>${escapeHtml(screenStateLabel())}</strong></span><span>Último frame: <strong data-screen-last-frame>${escapeHtml(formatTime(screenLastFrameAt))}</strong></span></div><div class="screen-viewer" data-screen-viewer><div class="screen-actions"><button class="screen-button" type="button" data-screen-action="start" ${!canStartScreen || screenBusy ? "disabled" : ""}>Iniciar visualização</button><button class="screen-button screen-stop-button" type="button" data-screen-action="stop" ${!screenBusy || screenState === "connecting" ? "disabled" : ""}>Parar</button><button class="screen-button" type="button" data-screen-action="control-start" ${!canStartControl ? "disabled" : ""}>Iniciar controle</button><button class="screen-button screen-stop-button" type="button" data-screen-action="control-stop" ${controlState === "idle" || controlState === "error" ? "disabled" : ""}>Encerrar controle</button><button class="screen-button screen-fullscreen-button" type="button" data-screen-action="fullscreen" ${screenState !== "streaming" ? "disabled" : ""}>Tela cheia</button><span class="control-status" data-control-status>${escapeHtml(controlStateLabel())}</span><span class="fullscreen-status" data-fullscreen-status>Janela</span></div><p class="control-error" data-control-error role="status">${escapeHtml(controlErrorMessage)}</p><div class="screen-frame-wrap" data-screen-frame tabindex="0" aria-label="Visualização remota de ${escapeHtml(computer.hostname)}">${screenFrame}</div></div><p class="screen-fullscreen-error" data-screen-fullscreen-error role="status"></p><p class="screen-hint">A transmissão só começa após solicitação do técnico.</p>`)}
       ${section("REDE", detailRow("Gateways", (inventory.network?.gateways || []).join(", ")) + detailRow("DNS", (inventory.network?.dns_servers || []).join(", ")) + (network || `<div class="hardware-item"><span>Interfaces não disponíveis.</span></div>`))}`;
     detailPanel.querySelector("[data-authorization-action]")?.addEventListener("click", (event) => {
       changeAuthorization(computer.id, event.currentTarget.dataset.authorizationAction);
@@ -208,6 +222,246 @@
       startScreenViewer(computer);
     });
     detailPanel.querySelector('[data-screen-action="stop"]')?.addEventListener("click", stopScreenViewer);
+    detailPanel.querySelector('[data-screen-action="control-start"]')?.addEventListener("click", startRemoteControl);
+    detailPanel.querySelector('[data-screen-action="control-stop"]')?.addEventListener("click", stopRemoteControl);
+    detailPanel.querySelector('[data-screen-action="fullscreen"]')?.addEventListener("click", toggleScreenFullscreen);
+    bindScreenInput();
+    updateFullscreenButton();
+  }
+
+  function controlStateLabel() {
+    return ({
+      idle: "Controle desligado",
+      starting: "Iniciando controle",
+      active: "Controle ativo",
+      stopping: "Encerrando controle",
+      error: "Controle indisponível",
+    })[controlState] || "Controle inativo";
+  }
+
+  function normalizedImagePoint(event, clampToImage = false) {
+    const image = detailPanel.querySelector("[data-screen-frame] .screen-frame");
+    if (!image || !image.naturalWidth || !image.naturalHeight) return null;
+    const rect = image.getBoundingClientRect();
+    const scale = Math.min(rect.width / image.naturalWidth, rect.height / image.naturalHeight);
+    const width = image.naturalWidth * scale;
+    const height = image.naturalHeight * scale;
+    const left = rect.left + (rect.width - width) / 2;
+    const top = rect.top + (rect.height - height) / 2;
+    let x = (event.clientX - left) / width;
+    let y = (event.clientY - top) / height;
+    if (!clampToImage && (x < 0 || x > 1 || y < 0 || y > 1)) return null;
+    x = Math.max(0, Math.min(1, x));
+    y = Math.max(0, Math.min(1, y));
+    return { x, y };
+  }
+
+  function sendControlInput(input) {
+    if (controlState !== "active" || screenSocket?.readyState !== WebSocket.OPEN) return false;
+    screenSocket.send(JSON.stringify({ type: "control.input", ...input }));
+    return true;
+  }
+
+  function remoteKeyName(event) {
+    if (/^Key[A-Z]$/.test(event.code)) return event.code.slice(3).toLowerCase();
+    if (/^Digit[0-9]$/.test(event.code)) return event.code.slice(5);
+    if (/^F([1-9]|1[0-2])$/.test(event.code)) return event.code.toLowerCase();
+    return ({
+      Enter: "enter", Escape: "esc", Tab: "tab", Space: "space", Backspace: "backspace",
+      Delete: "delete", Insert: "insert", Home: "home", End: "end", PageUp: "pageup",
+      PageDown: "pagedown", ArrowUp: "up", ArrowDown: "down", ArrowLeft: "left",
+      ArrowRight: "right", ControlLeft: "ctrl", ControlRight: "ctrl", AltLeft: "alt",
+      AltRight: "alt", ShiftLeft: "shift", ShiftRight: "shift", MetaLeft: "win", MetaRight: "win",
+      Minus: "-", Equal: "=", BracketLeft: "[", BracketRight: "]", Backslash: "\\",
+      Semicolon: ";", Quote: "'", Comma: ",", Period: ".", Slash: "/", Backquote: "`",
+    })[event.code] || null;
+  }
+
+  function bindScreenInput() {
+    const frameWrap = detailPanel.querySelector("[data-screen-frame]");
+    const viewer = detailPanel.querySelector("[data-screen-viewer]");
+    if (!frameWrap || !viewer) return;
+    frameWrap.addEventListener("pointermove", (event) => {
+      if (controlState !== "active") return;
+      const point = normalizedImagePoint(event);
+      if (!point) return;
+      lastControlPointer = point;
+      queuePointerMove(point);
+    });
+    frameWrap.addEventListener("pointerdown", (event) => {
+      const button = event.button === 0 ? "left" : event.button === 2 ? "right" : null;
+      const point = normalizedImagePoint(event);
+      if (controlState !== "active" || !button || !point) return;
+      event.preventDefault();
+      frameWrap.focus({ preventScroll: true });
+      try { frameWrap.setPointerCapture(event.pointerId); } catch {}
+      lastControlPointer = point;
+      flushPointerMove(point);
+      if (sendControlInput({ action: "pointer.down", button, ...point })) {
+        controlButtonsDown.add(button);
+      }
+    });
+    frameWrap.addEventListener("pointerup", (event) => {
+      const button = event.button === 0 ? "left" : event.button === 2 ? "right" : null;
+      if (controlState !== "active" || !button || !controlButtonsDown.has(button)) return;
+      const point = normalizedImagePoint(event, true) || lastControlPointer;
+      sendControlInput({ action: "pointer.up", button, ...point });
+      controlButtonsDown.delete(button);
+    });
+    frameWrap.addEventListener("pointercancel", releaseHeldInputs);
+    frameWrap.addEventListener("contextmenu", (event) => {
+      if (controlState === "active") event.preventDefault();
+    });
+    frameWrap.addEventListener("wheel", (event) => {
+      if (controlState !== "active") return;
+      const point = normalizedImagePoint(event);
+      if (!point) return;
+      event.preventDefault();
+      sendControlInput({
+        action: "pointer.scroll",
+        delta_y: Math.max(-1200, Math.min(1200, event.deltaY)),
+        ...point,
+      });
+    }, { passive: false });
+    viewer.addEventListener("keydown", (event) => {
+      if (controlState !== "active" || event.isComposing) return;
+      if (event.target !== frameWrap && !event.target.classList?.contains("screen-frame")) return;
+      const key = remoteKeyName(event);
+      if (!key) return;
+      event.preventDefault();
+      if (event.repeat || controlKeysDown.has(key)) return;
+      if (sendControlInput({ action: "key.down", key })) controlKeysDown.add(key);
+    });
+    viewer.addEventListener("keyup", (event) => {
+      if (event.target !== frameWrap && !event.target.classList?.contains("screen-frame")) return;
+      const key = remoteKeyName(event);
+      if (controlState !== "active" || !key || !controlKeysDown.has(key)) return;
+      event.preventDefault();
+      sendControlInput({ action: "key.up", key });
+      controlKeysDown.delete(key);
+    });
+  }
+
+  function releaseHeldInputs() {
+    flushPointerMove();
+    for (const key of controlKeysDown) sendControlInput({ action: "key.up", key });
+    for (const button of controlButtonsDown) {
+      sendControlInput({ action: "pointer.up", button, ...lastControlPointer });
+    }
+    controlKeysDown.clear();
+    controlButtonsDown.clear();
+  }
+
+  function clearHeldInputState() {
+    if (pointerMoveTimer !== null) clearTimeout(pointerMoveTimer);
+    pointerMoveTimer = null;
+    pendingPointerMove = null;
+    controlKeysDown.clear();
+    controlButtonsDown.clear();
+  }
+
+  function queuePointerMove(point) {
+    pendingPointerMove = point;
+    const elapsed = performance.now() - lastPointerMoveAt;
+    if (elapsed >= 50) {
+      flushPointerMove();
+      return;
+    }
+    if (pointerMoveTimer === null) {
+      pointerMoveTimer = setTimeout(flushPointerMove, 50 - elapsed);
+    }
+  }
+
+  function flushPointerMove(point = null) {
+    if (pointerMoveTimer !== null) clearTimeout(pointerMoveTimer);
+    pointerMoveTimer = null;
+    const nextPoint = point || pendingPointerMove;
+    pendingPointerMove = null;
+    if (nextPoint && controlState === "active") {
+      sendControlInput({ action: "pointer.move", ...nextPoint });
+      lastPointerMoveAt = performance.now();
+    }
+  }
+
+  function updateControlControls() {
+    const status = detailPanel.querySelector("[data-control-status]");
+    if (status) {
+      status.textContent = controlStateLabel();
+      status.classList.toggle("is-active", controlState === "active");
+    }
+    const error = detailPanel.querySelector("[data-control-error]");
+    if (error) error.textContent = controlErrorMessage;
+    const computer = computers.find((item) => item.id === selectedId);
+    const startButton = detailPanel.querySelector('[data-screen-action="control-start"]');
+    const stopButton = detailPanel.querySelector('[data-screen-action="control-stop"]');
+    if (startButton) {
+      startButton.disabled = !computer || computer.authorization_status !== "authorized"
+        || !computer.channel_connected || screenState !== "streaming"
+        || !["idle", "error"].includes(controlState);
+    }
+    if (stopButton) stopButton.disabled = !["starting", "active", "stopping"].includes(controlState);
+  }
+
+  function updateFullscreenButton() {
+    const button = detailPanel.querySelector('[data-screen-action="fullscreen"]');
+    const viewer = detailPanel.querySelector("[data-screen-viewer]");
+    if (!button || !viewer) return;
+    const isFullscreen = document.fullscreenElement === viewer;
+    button.textContent = isFullscreen ? "Sair da tela cheia" : "Tela cheia";
+    button.setAttribute("aria-pressed", String(isFullscreen));
+    button.disabled = screenState !== "streaming" && !isFullscreen;
+    const fullscreenStatus = detailPanel.querySelector("[data-fullscreen-status]");
+    if (fullscreenStatus) fullscreenStatus.textContent = isFullscreen ? "Tela cheia ativa" : "Janela";
+    if (isFullscreen && controlState === "active") {
+      detailPanel.querySelector("[data-screen-frame]")?.focus({ preventScroll: true });
+    }
+  }
+
+  async function toggleScreenFullscreen() {
+    const viewer = detailPanel.querySelector("[data-screen-viewer]");
+    const error = detailPanel.querySelector("[data-screen-fullscreen-error]");
+    if (!viewer) return;
+    if (error) error.textContent = "";
+    console.info("[screen-fullscreen] click", {
+      enabled: document.fullscreenEnabled,
+      supported: typeof viewer.requestFullscreen === "function",
+    });
+    try {
+      if (document.fullscreenElement === viewer) await document.exitFullscreen();
+      else await viewer.requestFullscreen();
+    } catch (reason) {
+      console.error("[screen-fullscreen] rejected", {
+        name: reason?.name || "UnknownError",
+        message: reason?.message || "No rejection message",
+        enabled: document.fullscreenEnabled,
+        secureContext: window.isSecureContext,
+      });
+      if (error) error.textContent = `Tela cheia recusada: ${reason?.name || "erro do navegador"}`;
+    }
+  }
+
+  async function startRemoteControl() {
+    const computer = computers.find((item) => item.id === selectedId);
+    if (
+      !computer || computer.authorization_status !== "authorized" || !computer.channel_connected
+      || screenState !== "streaming" || screenSocket?.readyState !== WebSocket.OPEN
+      || !["idle", "error"].includes(controlState)
+    ) return;
+    if (!window.confirm(`Iniciar o controle de mouse e teclado em ${computer.hostname}?`)) return;
+    controlState = "starting";
+    controlErrorMessage = "";
+    console.info("[remote-control] start requested");
+    updateControlControls();
+    screenSocket.send(JSON.stringify({ type: "control.start" }));
+  }
+
+  function stopRemoteControl() {
+    if (!screenSocket || screenSocket.readyState !== WebSocket.OPEN
+      || !["starting", "active"].includes(controlState)) return;
+    releaseHeldInputs();
+    controlState = "stopping";
+    updateControlControls();
+    screenSocket.send(JSON.stringify({ type: "control.stop" }));
   }
 
   function screenStateLabel() {
@@ -237,6 +491,8 @@
     if (stopButton) {
       stopButton.disabled = !["starting", "streaming", "stopping"].includes(screenState);
     }
+    updateControlControls();
+    updateFullscreenButton();
   }
 
   async function startScreenViewer(computer) {
@@ -254,6 +510,10 @@
     screenState = "connecting";
     screenFrameData = null;
     screenLastFrameAt = null;
+    controlState = "idle";
+    screenRemoteWidth = 0;
+    screenRemoteHeight = 0;
+    clearHeldInputState();
     const frameWrap = detailPanel.querySelector("[data-screen-frame]");
     if (frameWrap) frameWrap.innerHTML = '<div class="screen-placeholder">Aguardando primeiro frame</div>';
     updateScreenStatus();
@@ -276,29 +536,82 @@
         try { message = JSON.parse(event.data); } catch { return; }
         if (message.type === "screen.start_ack") {
           screenState = message.accepted ? "streaming" : "error";
+          screenRemoteWidth = Number.isInteger(message.screen_width) ? message.screen_width : 0;
+          screenRemoteHeight = Number.isInteger(message.screen_height) ? message.screen_height : 0;
           updateScreenStatus(message.accepted ? "Transmitindo" : `Indisponível: ${message.reason || "captura recusada"}`);
         } else if (message.type === "screen.frame" && typeof message.data === "string") {
-          screenFrameData = message.data;
           screenLastFrameAt = new Date().toISOString();
           screenState = "streaming";
-          const frameWrap = detailPanel.querySelector("[data-screen-frame]");
-          if (frameWrap) frameWrap.innerHTML = `<img class="screen-frame" src="data:image/jpeg;base64,${message.data}" alt="Tela de ${escapeHtml(computer.hostname)}">`;
+          const renderSequence = ++screenRenderSequence;
+          const nextFrame = new Image();
+          nextFrame.className = "screen-frame";
+          nextFrame.alt = `Tela de ${computer.hostname}`;
+          nextFrame.src = `data:image/jpeg;base64,${message.data}`;
+          nextFrame.decode().then(() => {
+            if (screenSocket !== socket || renderSequence !== screenRenderSequence) return;
+            screenFrameData = message.data;
+            const frameWrap = detailPanel.querySelector("[data-screen-frame]");
+            if (!frameWrap) return;
+            const currentFrame = frameWrap.querySelector(".screen-frame");
+            if (currentFrame) currentFrame.replaceWith(nextFrame);
+            else frameWrap.replaceChildren(nextFrame);
+          }).catch(() => {});
           updateScreenStatus("Transmitindo");
+        } else if (message.type === "control.start_ack") {
+          console.info("[remote-control] start ack", {
+            accepted: message.accepted === true,
+            reason: message.reason || "accepted",
+          });
+          if (message.accepted === true
+            && Number.isInteger(message.screen_width) && Number.isInteger(message.screen_height)
+            && message.screen_width === screenRemoteWidth && message.screen_height === screenRemoteHeight) {
+            controlState = "active";
+            controlErrorMessage = "";
+            detailPanel.querySelector("[data-screen-frame]")?.focus({ preventScroll: true });
+            updateScreenStatus("Controle ativo");
+          } else {
+            controlState = "error";
+            controlErrorMessage = message.reason || "screen_resolution_mismatch";
+            if (message.accepted === true && screenSocket === socket) {
+              socket.send(JSON.stringify({ type: "control.stop" }));
+            }
+            updateScreenStatus("Controle não iniciado");
+          }
+        } else if (message.type === "control.stop_ack") {
+          console.info("[remote-control] stop ack", { reason: message.reason || "operator_request" });
+          controlState = "idle";
+          controlErrorMessage = message.reason && message.reason !== "operator_request"
+            ? `Encerrado: ${message.reason}` : "";
+          clearHeldInputState();
+          updateScreenStatus(controlErrorMessage || "Controle encerrado");
         } else if (message.type === "screen.stop_ack") {
           screenState = "stopped";
+          controlState = "idle";
+          screenRemoteWidth = 0;
+          screenRemoteHeight = 0;
+          clearHeldInputState();
           updateScreenStatus("Parado");
         }
       });
-      socket.addEventListener("close", () => {
+      socket.addEventListener("close", (event) => {
         if (screenSocket !== socket) return;
+        console.warn("[screen-viewer] websocket closed", {
+          code: event.code,
+          reason: event.reason || "no_reason",
+        });
         screenSocket = null;
         screenComputerId = null;
         screenState = "stopped";
+        controlState = "idle";
+        clearHeldInputState();
         updateScreenStatus("Canal de visualização encerrado");
       });
       socket.addEventListener("error", () => {
         if (screenSocket !== socket) return;
+        console.error("[screen-viewer] websocket error");
         screenState = "error";
+        controlState = "idle";
+        clearHeldInputState();
         updateScreenStatus("Falha no canal de visualização");
       });
     } catch (error) {
@@ -312,6 +625,10 @@
   function stopScreenViewer() {
     if (!screenSocket || screenSocket.readyState !== WebSocket.OPEN) return;
     if (["starting", "streaming"].includes(screenState)) {
+      if (["starting", "active"].includes(controlState)) {
+        releaseHeldInputs();
+        controlState = "stopping";
+      }
       screenState = "stopping";
       updateScreenStatus();
       screenSocket.send(JSON.stringify({ type: "screen.stop" }));
@@ -320,9 +637,15 @@
 
   function closeScreenViewer() {
     const socket = screenSocket;
+    releaseHeldInputs();
     screenSocket = null;
+    screenRenderSequence += 1;
     screenComputerId = null;
     screenState = "stopped";
+    controlState = "idle";
+    screenRemoteWidth = 0;
+    screenRemoteHeight = 0;
+    clearHeldInputState();
     screenFrameData = null;
     screenLastFrameAt = null;
     if (socket && socket.readyState < WebSocket.CLOSING) socket.close(1000, "viewer mudou de máquina");
@@ -357,11 +680,22 @@
   authorizationFilter.addEventListener("change", loadComputers);
   document.querySelector("#refresh-button").addEventListener("click", loadComputers);
   document.addEventListener("keydown", (event) => {
-    if (event.key === "/" && !["INPUT", "TEXTAREA"].includes(document.activeElement.tagName)) {
+    if (!event.defaultPrevented && event.key === "/"
+      && !["INPUT", "TEXTAREA"].includes(document.activeElement.tagName)) {
       event.preventDefault();
       searchInput.focus();
     }
   });
+  document.addEventListener("fullscreenchange", () => {
+    console.info("[screen-fullscreen] changed", {
+      active: document.fullscreenElement !== null,
+    });
+    updateFullscreenButton();
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) releaseHeldInputs();
+  });
+  window.addEventListener("blur", releaseHeldInputs);
 
   if (token()) showApp(); else showLogin();
 })();

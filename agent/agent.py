@@ -64,6 +64,8 @@ def run(once: bool = False, print_json: bool = False) -> int:
         agent_id = get_agent_id(config.machine_id_file)
         if config.server_url and not config.token:
             raise ValueError("Configure PREFEITURA_AGENT_TOKEN para enviar inventário")
+        if config.token and not config.individual_credential:
+            LOGGER.warning("Usando credencial global legada; provisionar PREFEITURA_AGENT_CREDENTIAL")
         if config.server_url:
             _validate_server_url(config.server_url)
 
@@ -99,6 +101,7 @@ def run(once: bool = False, print_json: bool = False) -> int:
                     config.token or "",
                     config.interval_seconds,
                     send_inventory_if_due,
+                    individual_credential=config.individual_credential,
                 )
             except (OSError, RuntimeError, TimeoutError, ValueError) as exc:
                 LOGGER.warning("Canal persistente desconectado: %s", exc)

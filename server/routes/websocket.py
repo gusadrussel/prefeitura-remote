@@ -13,6 +13,15 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from server.database.models import Computer
+from server.services.remote_control import (
+    valid_control_start_ack,
+    valid_control_stop_ack,
+    valid_screen_start_ack,
+    valid_screen_stop_ack,
+)
+from server.services.agent_credentials import has_active_agent_credential
+from server.services.rate_limits import peer_address
+from server.services.agent_credentials import verify_agent_credential
 
 LOGGER = logging.getLogger("prefeitura_remote.websocket")
 websocket_router = APIRouter()
@@ -61,15 +70,43 @@ def _is_secure_or_loopback(websocket: WebSocket) -> bool:
 
 
 def _credential_is_valid(websocket: WebSocket, agent_id: str) -> bool:
-    agent_secret = websocket.app.state.settings.agent_token
+    settings = websocket.app.state.settings
     authorization = websocket.headers.get("authorization", "")
     scheme, _, credential = authorization.partition(" ")
-    expected = derive_agent_channel_credential(agent_id, agent_secret) if agent_secret else ""
-    return bool(
-        expected
-        and scheme.lower() == "bearer"
-        and credential
-        and hmac.compare_digest(credential.strip(), expected)
+    provided = credential.strip() if scheme.lower() == "bearer" else ""
+    session: Session = websocket.app.state.session_factory()
+    try:
+        computer = session.scalar(select(Computer).where(Computer.agent_id == agent_id))
+        has_individual_credential = bool(
+            computer
+            and (computer.agent_credential_hash is not None or computer.agent_credential_revoked)
+        )
+        if computer and computer.agent_credential_hash is not None:
+            return (
+                not computer.agent_credential_revoked
+                and verify_agent_credential(provided, computer.agent_credential_hash)
+            )
+        if has_individual_credential or not settings.allow_legacy_agent_token:
+            return False
+        legacy_secret = settings.agent_token
+        if not legacy_secret:
+            return False
+        expected = derive_agent_channel_credential(agent_id, legacy_secret)
+        return bool(provided and hmac.compare_digest(provided, expected))
+    finally:
+        session.close()
+
+
+def _websocket_rate_key(websocket: WebSocket, kind: str, resource_id: str) -> str:
+    return f"websocket:{kind}:{peer_address(websocket.client)}:{resource_id}"
+
+
+def _websocket_connection_allowed(websocket: WebSocket, kind: str, resource_id: str) -> bool:
+    settings = websocket.app.state.settings
+    return websocket.app.state.rate_limiter.allow(
+        _websocket_rate_key(websocket, kind, resource_id),
+        limit=settings.websocket_connections_per_window,
+        window_seconds=settings.rate_limit_window_seconds,
     )
 
 import base64
@@ -79,7 +116,11 @@ def _find_authorized_computer(websocket: WebSocket, agent_id: str) -> Computer |
     session: Session = websocket.app.state.session_factory()
     try:
         computer = session.scalar(select(Computer).where(Computer.agent_id == agent_id))
-        if computer is None or computer.authorization_status != "authorized":
+        if (
+            computer is None
+            or computer.authorization_status != "authorized"
+            or not has_active_agent_credential(computer, websocket.app.state.settings)
+        ):
             return None
         return computer
     finally:
@@ -92,11 +133,16 @@ def _valid_screen_frame(message: dict, settings) -> bool:
     height = message.get("height")
     sequence = message.get("sequence")
     if (
-        message.get("format") != "jpeg"
+        set(message) != {"type", "format", "data", "width", "height", "sequence"}
+        or message.get("type") != "screen.frame"
+        or message.get("format") != "jpeg"
         or not isinstance(data, str)
         or not isinstance(width, int)
+        or isinstance(width, bool)
         or not isinstance(height, int)
+        or isinstance(height, bool)
         or not isinstance(sequence, int)
+        or isinstance(sequence, bool)
         or sequence < 0
         or width < 1
         or height < 1
@@ -125,10 +171,24 @@ async def agent_channel(websocket: WebSocket, agent_id: str) -> None:
     if not _is_secure_or_loopback(websocket):
         await _close_policy(websocket, "WSS obrigatório fora de localhost")
         return
+    settings = websocket.app.state.settings
+    peer = peer_address(websocket.client)
+    if not _websocket_connection_allowed(websocket, "agent", agent_id):
+        await websocket.close(code=1013, reason="Limite de conexões atingido")
+        return
+    auth_key = f"websocket-auth-failure:{peer}"
     if not _credential_is_valid(websocket, agent_id):
+        if not websocket.app.state.rate_limiter.allow(
+            auth_key,
+            limit=settings.auth_failures_per_window,
+            window_seconds=settings.rate_limit_window_seconds,
+        ):
+            await websocket.close(code=1013, reason="Limite de autenticação atingido")
+            return
         await _close_policy(websocket, "Credencial do agente inválida")
         return
-
+    websocket.app.state.rate_limiter.reset(auth_key)
+    websocket.app.state.rate_limiter.reset(auth_key)
     computer = _find_authorized_computer(websocket, agent_id)
     if computer is None:
         await _close_policy(websocket, "Agente inexistente ou não autorizado")
@@ -141,7 +201,6 @@ async def agent_channel(websocket: WebSocket, agent_id: str) -> None:
     receive_task = None
     command_task = None
     try:
-        settings = websocket.app.state.settings
         try:
             hello = await asyncio.wait_for(
                 websocket.receive_json(), timeout=settings.agent_hello_timeout_seconds
@@ -208,6 +267,9 @@ async def agent_channel(websocket: WebSocket, agent_id: str) -> None:
 
             message_type = message.get("type")
             if message_type == "heartbeat":
+                if not _credential_is_valid(websocket, agent_id):
+                    await _close_policy(websocket, "Credencial do agente revogada ou inválida")
+                    break
                 if _find_authorized_computer(websocket, agent_id) is None:
                     await _close_policy(websocket, "Autorização revogada")
                     break
@@ -221,7 +283,7 @@ async def agent_channel(websocket: WebSocket, agent_id: str) -> None:
                 await websocket.send_json({"type": "disconnect_ack"})
                 break
             elif message_type == "screen.start_ack":
-                if not isinstance(message.get("accepted"), bool):
+                if not valid_screen_start_ack(message, settings):
                     await websocket.close(code=1003, reason="screen.start_ack inválido")
                     break
                 if not screen_streams.agent_started(agent_id, message) and message["accepted"]:
@@ -230,7 +292,10 @@ async def agent_channel(websocket: WebSocket, agent_id: str) -> None:
                 if not _valid_screen_frame(message, settings):
                     await websocket.close(code=1003, reason="screen.frame inválido")
                     break
-                if _find_authorized_computer(websocket, agent_id) is None:
+                if (
+                    not _credential_is_valid(websocket, agent_id)
+                    or _find_authorized_computer(websocket, agent_id) is None
+                ):
                     registry.send(agent_id, {"type": "screen.stop"})
                     screen_streams.agent_disconnected(agent_id)
                     await _close_policy(websocket, "Autorização revogada")
@@ -243,10 +308,34 @@ async def agent_channel(websocket: WebSocket, agent_id: str) -> None:
                     await _close_policy(websocket, "Frame sem screen.start ativo")
                     break
             elif message_type == "screen.stop_ack":
-                if not isinstance(message.get("stopped"), bool):
+                if not valid_screen_stop_ack(message):
                     await websocket.close(code=1003, reason="screen.stop_ack inválido")
                     break
                 screen_streams.agent_stopped(agent_id, message)
+            elif message_type == "control.start_ack":
+                if not valid_control_start_ack(message):
+                    LOGGER.warning("remote_control_ack_rejected reason=invalid_message agent_id=%s", agent_id)
+                    await websocket.close(code=1003, reason="control.start_ack inválido")
+                    break
+                LOGGER.info(
+                    "remote_control_start_ack accepted=%s reason=%s agent_id=%s",
+                    message["accepted"],
+                    message.get("reason", "accepted"),
+                    agent_id,
+                )
+                if not screen_streams.agent_control_started(agent_id, message) and message["accepted"]:
+                    registry.send(agent_id, {"type": "control.stop"})
+            elif message_type == "control.stop_ack":
+                if not valid_control_stop_ack(message):
+                    LOGGER.warning("remote_control_stop_ack_rejected reason=invalid_message agent_id=%s", agent_id)
+                    await websocket.close(code=1003, reason="control.stop_ack inválido")
+                    break
+                LOGGER.info(
+                    "remote_control_stop_ack reason=%s agent_id=%s",
+                    message.get("reason", "operator_request"),
+                    agent_id,
+                )
+                screen_streams.agent_control_stopped(agent_id, message)
             else:
                 await websocket.close(code=1003, reason="Tipo de mensagem não suportado")
                 break

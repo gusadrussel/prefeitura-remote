@@ -1,7 +1,7 @@
 """In-process registry for currently connected, authenticated agents."""
 
 import uuid
-from asyncio import Queue, QueueFull
+from asyncio import Queue, QueueEmpty, QueueFull
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -64,4 +64,16 @@ class AgentConnectionRegistry:
             connection.outbound.put_nowait(message)
         except QueueFull:
             return False
+        return True
+
+    def send_urgent(self, agent_id: str, message: dict) -> bool:
+        connection = self._connections.get(agent_id)
+        if connection is None or not connection.connected:
+            return False
+        while True:
+            try:
+                connection.outbound.get_nowait()
+            except QueueEmpty:
+                break
+        connection.outbound.put_nowait(message)
         return True
