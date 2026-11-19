@@ -167,6 +167,7 @@ def _valid_screen_frame(message: dict, settings) -> bool:
 
 
 async def _close_policy(websocket: WebSocket, reason: str) -> None:
+    LOGGER.info("Canal do agente encerrado por política: %s", reason)
     await websocket.close(code=1008, reason=reason)
 
 

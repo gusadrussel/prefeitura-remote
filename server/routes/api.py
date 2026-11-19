@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Callable
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
+from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
@@ -766,7 +766,7 @@ def list_messages(computer_id: int, request: Request, authorization: str | None 
     return [{"id": m.id, "sender": m.sender, "message": m.message, "created_at": m.created_at} for m in reversed(rows)]
 
 @router.post("/api/v1/admin/computers/{computer_id}/messages")
-def send_message(computer_id: int, request: Request, message: str, authorization: str | None = Header(default=None), session: Session = Depends(get_session)):
+def send_message(computer_id: int, request: Request, message: str = Body(embed=True), authorization: str | None = Header(default=None), session: Session = Depends(get_session)):
     tech = _technician(request, authorization)
     computer = session.get(Computer, computer_id)
     if not computer: raise HTTPException(status_code=404, detail="Computador não encontrado")

@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 from PIL import Image
 
 from agent.connection import run_websocket_session
+from agent.consent import ConsentController
 from agent.remote_input import RemoteInputController
 from agent.screen_capture import encode_rgb_frame
 
@@ -59,7 +60,34 @@ class ScreenCaptureLifecycleTests(unittest.TestCase):
         return connection
 
     def _run_session(self, connection, capture_factory, stop_event, remote_input=None):
-        with patch("agent.connection.connect", return_value=connection):
+        # Simulate explicit local acceptance, with real consent state validation.
+        # Only UI rendering and the transport are replaced; no capture/input backend
+        # can be reached before request -> local accept -> server result.
+        original_recv = connection.recv
+        original_request = ConsentController.request
+        def accept_request(controller, request_id, *args):
+            with patch("agent.consent.threading.Thread") as thread:
+                thread.return_value.is_alive.return_value = False
+                result = original_request(controller, request_id, *args)
+            controller._emit("accept", request_id)
+            return result
+        pending = []
+        def receive(*args, **kwargs):
+            if pending:
+                return pending.pop(0)
+            raw = original_recv(*args, **kwargs)
+            message = json.loads(raw)
+            if message["type"] in {"screen.start", "control.start"}:
+                mode = "view" if message["type"] == "screen.start" else "control"
+                request_id = f"accepted-{mode}-{original_recv.call_count}"
+                pending.extend([json.dumps({"type":"session.consent_result", "request_id":request_id,
+                                            "approved":True,"reason":"user_accepted"}), raw])
+                return json.dumps({"type":"session.consent_request", "request_id":request_id,
+                    "technician_name":"Test", "mode":mode,"hostname":"TEST","expires_in":60})
+            return raw
+        with patch("agent.connection.connect", return_value=connection), \
+             patch.object(connection, "recv", side_effect=receive), \
+             patch.object(ConsentController, "request", accept_request):
             run_websocket_session(
                 "http://127.0.0.1:8000",
                 "agent-1",
@@ -381,6 +409,28 @@ class ScreenCaptureLifecycleTests(unittest.TestCase):
         control_ack = next(item for item in sent if item["type"] == "control.stop_ack")
         self.assertEqual(control_ack["reason"], "capture_failed")
         self.assertEqual(remote_input.stop_count, 1)
+        self.assertEqual(capture.close_count, 1)
+
+    def test_capture_initialization_failure_allows_new_explicit_consent_and_retry(self):
+        stop = Event()
+        controllers = [ConsentController(), ConsentController()]
+        capture = FakeScreenCapture()
+        factory = MagicMock(side_effect=[RuntimeError("simulated unavailable display"), capture])
+        def sent(message):
+            if message["type"] == "screen.start_ack":
+                if not message["accepted"]:
+                    self.assertFalse(controllers[0].is_active("view"))
+                else:
+                    stop.set()
+        connection = self._fake_websocket([
+            '{"type":"hello_ack","agent_id":"agent-1","heartbeat_interval":1}',
+            '{"type":"screen.start","max_fps":1}',
+            '{"type":"screen.start","max_fps":1}',
+            '{"type":"disconnect_ack"}',
+        ], sent)
+        with patch("agent.connection.ConsentController", side_effect=controllers):
+            self._run_session(connection, factory, stop)
+        self.assertEqual(factory.call_count, 2)
         self.assertEqual(capture.close_count, 1)
 
 

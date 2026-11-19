@@ -14,9 +14,14 @@ class AgentConfig:
     individual_credential: bool
     interval_seconds: int
     machine_id_file: Path
+    enrollment_token: str | None
+    provisioned_agent_id: str | None = None
 
 
 def default_config_file() -> Path:
+    configured = os.getenv("PREFEITURA_AGENT_CONFIG_FILE")
+    if configured:
+        return Path(configured).expanduser()
     if platform.system() == "Windows":
         base = Path(os.getenv("PROGRAMDATA", r"C:\ProgramData"))
         return base / "PrefeituraRemote" / "config.json"
@@ -67,18 +72,33 @@ def load_config() -> AgentConfig:
         or None
     )
 
+    enrollment_token = (
+        os.getenv("PREFEITURA_ENROLLMENT_TOKEN")
+        or file_config.get("enrollment_token")
+        or None
+    )
+
     individual_credential = (
         os.getenv("PREFEITURA_AGENT_CREDENTIAL")
         or file_config.get("credential")
         or None
     )
 
-    token = (
-        individual_credential
-        or os.getenv("PREFEITURA_AGENT_TOKEN")
-        or file_config.get("token")
-        or None
-    )
+    # Enrollment bootstrap must win over any legacy global token from an
+    # older config.json. Once enrollment succeeds, the agent stores an
+    # individual credential in this same file, which then takes precedence.
+    # This prevents a stale global token from bypassing/short-circuiting
+    # automatic enrollment.
+    if individual_credential:
+        token = individual_credential
+    elif enrollment_token:
+        token = None
+    else:
+        token = (
+            os.getenv("PREFEITURA_AGENT_TOKEN")
+            or file_config.get("token")
+            or None
+        )
 
     try:
         interval = int(
@@ -101,6 +121,7 @@ def load_config() -> AgentConfig:
         server_url=server_url,
         token=token,
         individual_credential=individual_credential is not None,
+        enrollment_token=enrollment_token,
         interval_seconds=interval,
         machine_id_file=default_machine_id_file(),
     )

@@ -140,9 +140,9 @@
       ...options,
       headers: { ...authHeaders(), ...(options.headers || {}) },
     });
-    if (response.status === 401 || response.status === 503) {
+    if (response.status === 401) {
       sessionStorage.removeItem("dashboard_token");
-      showLogin(response.status === 401 ? "Token inválido ou expirado." : "Autenticação não configurada no servidor.");
+      showLogin("Token inválido ou expirado.");
       throw new Error("Acesso não autorizado.");
     }
     if (!response.ok) {
@@ -157,7 +157,14 @@
         502: "O servidor está temporariamente indisponível.",
         503: "O serviço está temporariamente indisponível.",
       };
-      throw new Error(messages[response.status] || detail.detail || "Não foi possível concluir a operação.");
+      const supportDetails = [
+        "Agente não conectado ao canal",
+        "Não foi possível solicitar confirmação no computador",
+        "Visualização consentida ativa obrigatória",
+        "Auditoria indisponível",
+      ];
+      throw new Error(supportDetails.includes(detail.detail) ? detail.detail :
+        messages[response.status] || "Não foi possível concluir a operação.");
     }
     return response.json();
   }
@@ -314,7 +321,7 @@
       try {
         const messages = await api(`/api/v1/admin/computers/${computer.id}/messages`);
         const box = detailPanel.querySelector('[data-chat-messages]');
-        if (!box) return;
+        if (!box || selectedId !== computer.id) return;
         const ordered = messages.slice(-40);
         const newestId = ordered.length ? Number(ordered[ordered.length - 1].id) : 0;
         const hadNewClientMessage = newestId > chatLastMessageId && ordered.some((m) => Number(m.id) > chatLastMessageId && m.sender === 'client');
@@ -330,19 +337,26 @@
           box.classList.add('chat-updated');
         }
         box.scrollTop = box.scrollHeight;
-      } catch (e) {
-        // Keep the chat visible if a transient polling request fails.
+      } catch (error) {
+        if (selectedId === computer.id) globalError.textContent = error.message;
       }
     }
-    detailPanel.querySelector('[data-chat-send]')?.addEventListener('click', async () => {
+    detailPanel.querySelector('[data-chat-send]')?.addEventListener('click', async (event) => {
       const input = detailPanel.querySelector('[data-chat-input]');
       const message = input?.value.trim();
       if (!message) return;
+      const button = event.currentTarget;
+      button.disabled = true;
       try {
-        await api(`/api/v1/admin/computers/${computer.id}/messages?message=${encodeURIComponent(message)}`, {method:'POST'});
+        const result = await api(`/api/v1/admin/computers/${computer.id}/messages`, {
+          method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({message}),
+        });
         input.value = '';
+        if (selectedId === computer.id) globalError.textContent = result.delivered
+          ? '' : 'Mensagem salva no histórico. O canal do cliente estava indisponível.';
         await loadChat();
       } catch(e) { globalError.textContent = e.message; }
+      finally { button.disabled = false; }
     });
     chatLastMessageId = 0;
     if (chatPollTimer !== null) clearInterval(chatPollTimer);
@@ -350,7 +364,6 @@
     chatPollTimer = setInterval(() => {
       if (selectedId === computer.id && document.visibilityState !== 'hidden') loadChat();
     }, 1200);
-    loadChat();
     detailPanel.querySelector("[data-rename-computer]")?.addEventListener("click", async () => {
       const name = prompt("Nome exibido no Prefeitura Remote:", computer.display_name || computer.hostname);
       if (!name) return;
