@@ -30,7 +30,7 @@ class AgentIdentityAndTransportTests(unittest.TestCase):
             "PREFEITURA_AGENT_TOKEN": "legacy-global-value",
             "PREFEITURA_AGENT_CREDENTIAL": "per-agent-random-value",
         }
-        with patch.dict("os.environ", environment, clear=True):
+        with patch.dict("os.environ", environment, clear=True), patch("agent.config.load_file_config", return_value={}):
             config = load_config()
         self.assertEqual(config.token, "per-agent-random-value")
         self.assertTrue(config.individual_credential)
@@ -39,7 +39,7 @@ class AgentIdentityAndTransportTests(unittest.TestCase):
             "os.environ",
             {key: value for key, value in environment.items() if key != "PREFEITURA_AGENT_CREDENTIAL"},
             clear=True,
-        ):
+        ), patch("agent.config.load_file_config", return_value={}):
             config = load_config()
         self.assertEqual(config.token, "legacy-global-value")
         self.assertFalse(config.individual_credential)

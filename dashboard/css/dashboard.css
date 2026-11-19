@@ -179,4 +179,70 @@ tbody tr.selected { background: #edf5ef; box-shadow: inset 3px 0 var(--forest); 
   .login-panel { padding: 22px 18px; }
   .footer { padding-inline: 14px; }
 }
-@media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; transition-duration: .01ms !important; } }
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; transition-duration: .01ms !important; } }.admin-tools{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:18px}.tool-card{background:#fff;border:1px solid #dfe5e2;border-radius:14px;padding:18px}.tool-card h2{margin:0 0 12px}.tool-card button{padding:8px 12px;border-radius:8px;border:1px solid #b8c5bf;background:#f7faf8;cursor:pointer}.tool-item{padding:10px 0;border-top:1px solid #edf1ef}.chat-box{margin-top:16px}.chat-message{padding:8px;border-bottom:1px solid #eee}@media(max-width:900px){.admin-tools{grid-template-columns:1fr}}
+.chat-compose{display:flex;gap:8px;margin-top:10px}.chat-compose input{flex:1;padding:9px;border:1px solid #ccd7d2;border-radius:8px}.chat-compose button{padding:9px 14px;border-radius:8px;border:1px solid #b8c5bf;background:#f7faf8;cursor:pointer}
+
+/* Refinamento visual: ações, chat e estados de atualização */
+.refresh-button { position: relative; overflow: hidden; transition: transform .15s ease, background .15s ease, opacity .15s ease; }
+.refresh-button:hover:not(:disabled) { transform: translateY(-1px); }
+.refresh-button:disabled { cursor: wait; opacity: .72; }
+.refresh-button.is-refreshing svg { animation: spin .75s linear infinite; }
+.detail-actions button, .tool-card button, .screen-button { border-radius: 9px; transition: transform .15s ease, box-shadow .15s ease, background .15s ease; }
+.detail-actions button:hover:not(:disabled), .tool-card button:hover:not(:disabled), .screen-button:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 5px 14px rgba(20,50,38,.10); }
+.screen-viewer { margin-top: 12px; padding: 14px; border: 1px solid #dfe7e2; border-radius: 14px; background: linear-gradient(180deg,#fbfcfb 0%,#f4f7f5 100%); }
+.screen-actions { margin-top: 0; }
+.screen-frame-wrap { border-radius: 11px; border: 1px solid #27372f; box-shadow: inset 0 0 0 1px rgba(255,255,255,.04), 0 10px 24px rgba(20,30,25,.08); }
+.chat-box { margin-top: 4px; padding: 12px; border: 1px solid #dfe7e2; border-radius: 14px; background: #f7f9f8; }
+.chat-box > [data-chat-messages] { min-height: 170px; max-height: 300px; overflow: auto; padding: 4px; display: flex; flex-direction: column; gap: 8px; scroll-behavior: smooth; }
+.chat-message { max-width: 86%; padding: 9px 11px; border: 1px solid #e0e7e3; border-radius: 12px; background: #fff; box-shadow: 0 2px 7px rgba(20,50,38,.04); }
+.chat-message-in { align-self: flex-start; border-top-left-radius: 4px; }
+.chat-message-out { align-self: flex-end; background: #e7f3ec; border-color: #cbe3d5; border-top-right-radius: 4px; }
+.chat-message-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 4px; color: var(--muted); font-size: 9px; }
+.chat-message-head strong { color: var(--ink); font-size: 9px; }
+.chat-message-body { color: var(--ink); font-size: 11px; line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere; }
+.chat-empty { margin: auto; padding: 28px 12px; color: var(--muted); font-size: 10px; text-align: center; }
+.chat-compose { padding-top: 9px; border-top: 1px solid #e5ebe7; }
+.chat-compose input { min-height: 38px; background: #fff; border-radius: 9px; outline: none; }
+.chat-compose input:focus { border-color: var(--forest); box-shadow: 0 0 0 3px #174f3d14; }
+.chat-compose button { min-height: 38px; border: 0; background: var(--forest); color: #fff; font-weight: 700; border-radius: 9px; }
+.chat-compose button:hover { background: var(--forest-dark); }
+.chat-updated { animation: chatPulse .35s ease-out; }
+.admin-tools { margin-top: 22px; }
+.installation-codes { margin-bottom: 16px; }
+.installation-codes p:empty { display: none; }
+.installation-codes dialog { max-width: min(34rem, 90vw); }
+.installation-codes input { display: block; max-width: 100%; margin: 8px 0 12px; font-family: monospace; }
+.tool-card { border-radius: 14px; box-shadow: 0 7px 24px rgba(26,46,38,.05); }
+.tool-card h2 { font-size: 13px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@keyframes chatPulse { 0% { background: #e2f1e8; } 100% { background: transparent; } }
+
+/* Consistent controls and dark theme */
+button, input, select { border-radius: 8px; }
+button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid var(--forest); outline-offset: 2px; }
+.icon-button { border-radius: 8px; }
+.full-width { width: 100%; }
+.login-fields { display: grid; gap: 8px; }
+.login-fields input { min-height: 40px; padding: 0 11px; border: 1px solid var(--line); background: var(--white); color: var(--ink); }
+.login-divider { display: flex; align-items: center; gap: 10px; color: var(--faint); font-size: 11px; margin: 3px 0; }
+.login-divider::before, .login-divider::after { content: ""; flex: 1; height: 1px; background: var(--line); }
+.login-divider span { text-transform: uppercase; letter-spacing: .08em; }
+.brand-mark { overflow: hidden; background: transparent; }
+.brand-mark img { width: 31px; height: 31px; display: block; }
+.refresh-button.is-refreshing svg { animation: spin .7s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+[data-theme="dark"] {
+  color-scheme: dark;
+  --ink: #edf5f1; --muted: #a8b8b0; --faint: #718078; --line: #2b3b35;
+  --paper: #0d1512; --white: #14201b; --forest: #2d8a69; --forest-dark: #09120f;
+  --mint: #183c30; --mint-ink: #77d3a9; --amber: #3b3118; --amber-ink: #e8c56d; --red: #df817b;
+}
+[data-theme="dark"] .topbar { background: #08100d; }
+[data-theme="dark"] .summary-strip, [data-theme="dark"] .computer-list, [data-theme="dark"] .detail-panel,
+[data-theme="dark"] .tool-card, [data-theme="dark"] .login-panel { box-shadow: 0 10px 30px #00000020; }
+[data-theme="dark"] .search-field, [data-theme="dark"] .login-fields input { background: #0f1915; }
+[data-theme="dark"] .search-field input, [data-theme="dark"] input, [data-theme="dark"] select { color: var(--ink); }
+[data-theme="dark"] .brand-mark img { filter: brightness(.92); }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) { color-scheme: dark; }
+}

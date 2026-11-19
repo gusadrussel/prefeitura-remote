@@ -11,6 +11,7 @@ from urllib.parse import urlsplit
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from server.database.models import Computer
 from server.services.remote_control import (
@@ -21,7 +22,10 @@ from server.services.remote_control import (
 )
 from server.services.agent_credentials import has_active_agent_credential
 from server.services.rate_limits import peer_address
-from server.services.agent_credentials import verify_agent_credential
+from server.services.agent_credentials import verify_agent_credential, token_matches
+from server.services.task_cleanup import cancel_tasks
+from server.services.remote_consent import technician_session_valid
+from server.services.audit import audit_event
 
 LOGGER = logging.getLogger("prefeitura_remote.websocket")
 websocket_router = APIRouter()
@@ -83,7 +87,7 @@ def _credential_is_valid(websocket: WebSocket, agent_id: str) -> bool:
         )
         if computer and computer.agent_credential_hash is not None:
             return (
-                not computer.agent_credential_revoked
+                has_active_agent_credential(computer, settings)
                 and verify_agent_credential(provided, computer.agent_credential_hash)
             )
         if has_individual_credential or not settings.allow_legacy_agent_token:
@@ -92,7 +96,7 @@ def _credential_is_valid(websocket: WebSocket, agent_id: str) -> bool:
         if not legacy_secret:
             return False
         expected = derive_agent_channel_credential(agent_id, legacy_secret)
-        return bool(provided and hmac.compare_digest(provided, expected))
+        return bool(provided and token_matches(provided, expected))
     finally:
         session.close()
 
@@ -166,6 +170,14 @@ async def _close_policy(websocket: WebSocket, reason: str) -> None:
     await websocket.close(code=1008, reason=reason)
 
 
+def _save_chat(websocket, computer_id, message):
+    from server.database.models import ComputerMessage
+    with websocket.app.state.session_factory() as session:
+        session.add(ComputerMessage(computer_id=computer_id, technician_id=None, sender='client',
+                                    message=message, created_at=datetime.now(UTC)))
+        session.commit()
+
+
 @websocket_router.websocket("/ws/agents/{agent_id}")
 async def agent_channel(websocket: WebSocket, agent_id: str) -> None:
     if not _is_secure_or_loopback(websocket):
@@ -177,7 +189,7 @@ async def agent_channel(websocket: WebSocket, agent_id: str) -> None:
         await websocket.close(code=1013, reason="Limite de conexões atingido")
         return
     auth_key = f"websocket-auth-failure:{peer}"
-    if not _credential_is_valid(websocket, agent_id):
+    if not await run_in_threadpool(_credential_is_valid, websocket, agent_id):
         if not websocket.app.state.rate_limiter.allow(
             auth_key,
             limit=settings.auth_failures_per_window,
@@ -186,10 +198,9 @@ async def agent_channel(websocket: WebSocket, agent_id: str) -> None:
             await websocket.close(code=1013, reason="Limite de autenticação atingido")
             return
         await _close_policy(websocket, "Credencial do agente inválida")
-        return
+        return 
     websocket.app.state.rate_limiter.reset(auth_key)
-    websocket.app.state.rate_limiter.reset(auth_key)
-    computer = _find_authorized_computer(websocket, agent_id)
+    computer = await run_in_threadpool(_find_authorized_computer, websocket, agent_id)
     if computer is None:
         await _close_policy(websocket, "Agente inexistente ou não autorizado")
         return
@@ -217,7 +228,7 @@ async def agent_channel(websocket: WebSocket, agent_id: str) -> None:
             return
 
         # Recheck after hello so a concurrent revocation cannot create an active session.
-        computer = _find_authorized_computer(websocket, agent_id)
+        computer = await run_in_threadpool(_find_authorized_computer, websocket, agent_id)
         if computer is None:
             await _close_policy(websocket, "Agente não autorizado")
             return
@@ -266,7 +277,20 @@ async def agent_channel(websocket: WebSocket, agent_id: str) -> None:
                 break
 
             message_type = message.get("type")
-            if message_type == "session.consent_response":
+            if message_type == "chat.message":
+                if (not await run_in_threadpool(_credential_is_valid, websocket, agent_id)
+                        or await run_in_threadpool(_find_authorized_computer, websocket, agent_id) is None):
+                    await _close_policy(websocket, "Credencial ou autorização do agente inválida")
+                    break
+                if (set(message) != {"type", "message_id", "sender", "message"}
+                    or message.get("sender") != "client"
+                    or not isinstance(message.get("message"), str)
+                    or not 1 <= len(message["message"]) <= 2000
+                    or "\x00" in message["message"]):
+                    await websocket.close(code=1003, reason="Mensagem de chat inválida")
+                    break
+                await run_in_threadpool(_save_chat, websocket, computer.id, message['message'])
+            elif message_type == "session.consent_response":
                 if (
                     set(message) != {"type", "request_id", "accepted"}
                     or not isinstance(message["request_id"], str)
@@ -280,10 +304,9 @@ async def agent_channel(websocket: WebSocket, agent_id: str) -> None:
                 if consent is None:
                     continue
                 if consent.status == "approved":
-                    current = _find_authorized_computer(websocket, agent_id)
+                    current = await run_in_threadpool(_find_authorized_computer, websocket, agent_id)
                     if current is None:
-                        consent.status = "cancelled"
-                        consent.reason = "authorization_revoked"
+                        websocket.app.state.remote_consent.end(consent.request_id, "authorization_revoked")
                         registry.send(agent_id, {
                             "type": "session.consent_result",
                             "request_id": consent.request_id,
@@ -312,6 +335,10 @@ async def agent_channel(websocket: WebSocket, agent_id: str) -> None:
                         "remote_access_consent_response technician=%s computer_id=%s agent_id=%s request_id=%s approved=false reason=%s",
                         consent.technician_name, computer.id, agent_id, consent.request_id, consent.reason,
                     )
+                audit_event("remote_consent_response",principal=consent.principal,
+                    principal_type="bootstrap" if consent.bootstrap else "technician",
+                    computer_id=computer.id,agent_id=agent_id,request_id=consent.request_id,
+                    mode=consent.mode,outcome=consent.status,reason=consent.reason)
             elif message_type == "session.user_stop":
                 if set(message) != {"type", "request_id"} or not isinstance(message["request_id"], str):
                     await websocket.close(code=1003, reason="Parada de sessão inválida")
@@ -321,15 +348,16 @@ async def agent_channel(websocket: WebSocket, agent_id: str) -> None:
                     websocket.app.state.remote_consent.cancel_for_computer(computer.id, "user_stopped")
                 screen_streams.agent_disconnected(agent_id)
                 registry.send(agent_id, {"type": "session.remote_stop", "reason": "user_stopped"})
+                audit_event("remote_user_stop_received",agent_id=agent_id,computer_id=computer.id,request_id=message["request_id"])
                 LOGGER.info(
                     "remote_access_ended_by_user computer_id=%s agent_id=%s request_id=%s",
                     computer.id, agent_id, message["request_id"],
                 )
             elif message_type == "heartbeat":
-                if not _credential_is_valid(websocket, agent_id):
+                if not await run_in_threadpool(_credential_is_valid, websocket, agent_id):
                     await _close_policy(websocket, "Credencial do agente revogada ou inválida")
                     break
-                if _find_authorized_computer(websocket, agent_id) is None:
+                if await run_in_threadpool(_find_authorized_computer, websocket, agent_id) is None:
                     await _close_policy(websocket, "Autorização revogada")
                     break
                 connection = registry.heartbeat(agent_id, connection.connection_id)
@@ -347,13 +375,17 @@ async def agent_channel(websocket: WebSocket, agent_id: str) -> None:
                     break
                 if not screen_streams.agent_started(agent_id, message) and message["accepted"]:
                     registry.send(agent_id, {"type": "screen.stop"})
+                if not message["accepted"]:
+                    viewer = screen_streams.get(agent_id)
+                    if viewer is not None:
+                        websocket.app.state.remote_consent.end(viewer.view_request_id, "capture_unavailable")
             elif message_type == "screen.frame":
                 if not _valid_screen_frame(message, settings):
                     await websocket.close(code=1003, reason="screen.frame inválido")
                     break
                 if (
-                    not _credential_is_valid(websocket, agent_id)
-                    or _find_authorized_computer(websocket, agent_id) is None
+                    not await run_in_threadpool(_credential_is_valid, websocket, agent_id)
+                    or await run_in_threadpool(_find_authorized_computer, websocket, agent_id) is None
                 ):
                     registry.send(agent_id, {"type": "screen.stop"})
                     screen_streams.agent_disconnected(agent_id)
@@ -361,7 +393,12 @@ async def agent_channel(websocket: WebSocket, agent_id: str) -> None:
                     break
                 viewer = screen_streams.get(agent_id)
                 if viewer is not None and viewer.state == "streaming":
-                    screen_streams.publish_frame(agent_id, message)
+                    if (websocket.app.state.remote_consent.active(viewer.view_request_id, "view")
+                            and technician_session_valid(websocket.app, websocket.app.state.remote_consent.get(viewer.view_request_id))):
+                        screen_streams.publish_frame(agent_id, message)
+                    else:
+                        registry.send_urgent(agent_id, {"type":"screen.stop"})
+                        screen_streams.agent_disconnected(agent_id)
                 elif viewer is None or viewer.state == "idle":
                     registry.send(agent_id, {"type": "screen.stop"})
                     await _close_policy(websocket, "Frame sem screen.start ativo")
@@ -370,12 +407,19 @@ async def agent_channel(websocket: WebSocket, agent_id: str) -> None:
                 if not valid_screen_stop_ack(message):
                     await websocket.close(code=1003, reason="screen.stop_ack inválido")
                     break
+                viewer = screen_streams.get(agent_id)
+                if viewer is not None:
+                    websocket.app.state.remote_consent.end(viewer.view_request_id, "screen_stopped")
                 screen_streams.agent_stopped(agent_id, message)
             elif message_type == "control.start_ack":
                 if not valid_control_start_ack(message):
                     LOGGER.warning("remote_control_ack_rejected reason=invalid_message agent_id=%s", agent_id)
                     await websocket.close(code=1003, reason="control.start_ack inválido")
                     break
+                if not message["accepted"]:
+                    viewer = screen_streams.get(agent_id)
+                    if viewer is not None:
+                        websocket.app.state.remote_consent.end(viewer.control_request_id, "start_rejected")
                 LOGGER.info(
                     "remote_control_start_ack accepted=%s reason=%s agent_id=%s",
                     message["accepted"],
@@ -394,24 +438,24 @@ async def agent_channel(websocket: WebSocket, agent_id: str) -> None:
                     message.get("reason", "operator_request"),
                     agent_id,
                 )
+                viewer = screen_streams.get(agent_id)
+                if viewer is not None:
+                    websocket.app.state.remote_consent.end(viewer.control_request_id, "control_stopped")
                 screen_streams.agent_control_stopped(agent_id, message)
             else:
                 await websocket.close(code=1003, reason="Tipo de mensagem não suportado")
                 break
     except asyncio.CancelledError:
         LOGGER.debug("Canal do agente cancelado: %s", agent_id)
+        raise
     except WebSocketDisconnect:
         pass
     except (RuntimeError, ValueError):
         LOGGER.exception("Erro no canal do agente %s", agent_id)
     finally:
-        for task in (receive_task, command_task):
-            if task is not None:
-                task.cancel()
-        await asyncio.gather(
-            *(task for task in (receive_task, command_task) if task is not None),
-            return_exceptions=True,
-        )
-        screen_streams.agent_disconnected(agent_id)
-        if connection is not None:
-            registry.disconnect(agent_id, connection.connection_id)
+        # Only the owning connection may invalidate this agent's viewer. A
+        # rejected duplicate handshake must leave the existing session intact.
+        if connection is not None and registry.disconnect(agent_id, connection.connection_id) is not None:
+            screen_streams.agent_disconnected(agent_id)
+            websocket.app.state.remote_consent.cancel_for_computer(computer.id, "agent_disconnected")
+        await cancel_tasks(receive_task, command_task)

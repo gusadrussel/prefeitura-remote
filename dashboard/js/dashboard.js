@@ -3,6 +3,9 @@
   const appView = document.querySelector("#app-view");
   const loginForm = document.querySelector("#login-form");
   const tokenInput = document.querySelector("#token-input");
+  const usernameInput = document.querySelector("#username-input");
+  const passwordInput = document.querySelector("#password-input");
+  const themeButton = document.querySelector("#theme-button");
   const loginError = document.querySelector("#login-error");
   const logoutButton = document.querySelector("#logout-button");
   const rows = document.querySelector("#computer-rows");
@@ -10,6 +13,12 @@
   const authorizationFilter = document.querySelector("#authorization-filter");
   const detailPanel = document.querySelector("#detail-panel");
   const globalError = document.querySelector("#global-error");
+  const installationCodes = document.querySelector("#installation-codes");
+  const issueCode = document.querySelector("#issue-installation-code");
+  const codeError = document.querySelector("#installation-code-error");
+  const codeDialog = document.querySelector("#installation-code-dialog");
+  const issuedCode = document.querySelector("#issued-installation-code");
+  let installationSession = 0;
   const locale = "pt-BR";
   let computers = [];
   let selectedId = null;
@@ -19,6 +28,8 @@
   let screenState = "idle";
   let screenConsentRequestId = null;
   let screenConsentPollTimer = null;
+  let controlConsentRequestId = null;
+  let controlConsentPollTimer = null;
   let screenFrameData = null;
   let screenLastFrameAt = null;
   let screenRenderSequence = 0;
@@ -32,6 +43,8 @@
   let lastPointerMoveAt = 0;
   let pendingPointerMove = null;
   let pointerMoveTimer = null;
+  let chatPollTimer = null;
+  let chatLastMessageId = 0;
 
   const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
@@ -53,8 +66,24 @@
   };
   const token = () => sessionStorage.getItem("dashboard_token") || "";
   const authHeaders = () => ({ Authorization: `Bearer ${token()}` });
+  function applyTheme(theme) {
+    document.documentElement.dataset.theme = theme;
+    themeButton.textContent = theme === "dark" ? "☀" : "◐";
+    themeButton.title = theme === "dark" ? "Usar modo claro" : "Usar modo escuro";
+    themeButton.setAttribute("aria-label", themeButton.title);
+    localStorage.setItem("prefeitura-theme", theme);
+  }
+  applyTheme(localStorage.getItem("prefeitura-theme") || "light");
+  themeButton.addEventListener("click", () => applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark"));
 
   function showLogin(message = "") {
+    installationSession += 1;
+    installationCodes.classList.add("hidden");
+    issuedCode.value = "";
+    codeError.textContent = "";
+    codeDialog.close();
+    if (chatPollTimer !== null) { clearInterval(chatPollTimer); chatPollTimer = null; }
+    if (controlConsentPollTimer !== null) { clearInterval(controlConsentPollTimer); controlConsentPollTimer = null; }
     if (screenComputerId !== null) closeScreenViewer();
     appView.classList.add("hidden");
     loginPanel.classList.remove("hidden");
@@ -68,7 +97,43 @@
     appView.classList.remove("hidden");
     logoutButton.classList.remove("hidden");
     loadComputers();
+    loadAdminTools();
+    loadInstallationCodes();
   }
+
+  async function loadInstallationCodes() {
+    const session = installationSession;
+    try {
+      const response = await fetch("/api/v1/admin/installation-codes", { headers: authHeaders(), cache: "no-store" });
+      if (response.ok && session === installationSession) installationCodes.classList.remove("hidden");
+    } catch {
+      if (session === installationSession) installationCodes.classList.add("hidden");
+    }
+  }
+
+  issueCode.addEventListener("click", async () => {
+    const session = installationSession;
+    issueCode.disabled = true;
+    codeError.textContent = "";
+    try {
+      const result = await api("/api/v1/admin/installation-codes", { method: "POST", cache: "no-store" });
+      if (session !== installationSession) return;
+      issuedCode.value = result.code;
+      codeDialog.showModal();
+      issuedCode.select();
+    } catch (error) {
+      issuedCode.value = "";
+      if (session === installationSession) codeError.textContent = error.message;
+    } finally {
+      issueCode.disabled = false;
+    }
+  });
+  codeDialog.addEventListener("close", () => { issuedCode.value = ""; });
+  window.addEventListener("pagehide", () => {
+    installationSession += 1;
+    issuedCode.value = "";
+    codeDialog.close();
+  });
 
   async function api(path, options = {}) {
     const response = await fetch(path, {
@@ -80,12 +145,26 @@
       showLogin(response.status === 401 ? "Token inválido ou expirado." : "Autenticação não configurada no servidor.");
       throw new Error("Acesso não autorizado.");
     }
-    if (!response.ok) throw new Error(`Falha na API (${response.status}).`);
+    if (!response.ok) {
+      const detail = await response.json().catch(() => ({}));
+      const messages = {
+        400: "Confira os dados informados.",
+        403: "Esta ação não está disponível para seu perfil ou para este computador.",
+        404: "O item solicitado não foi encontrado.",
+        409: "O computador mudou de estado. Atualize a lista e tente novamente.",
+        429: "Muitas tentativas. Aguarde alguns instantes e tente novamente.",
+        500: "O servidor encontrou um problema.",
+        502: "O servidor está temporariamente indisponível.",
+        503: "O serviço está temporariamente indisponível.",
+      };
+      throw new Error(messages[response.status] || detail.detail || "Não foi possível concluir a operação.");
+    }
     return response.json();
   }
 
   async function loadComputers() {
     globalError.textContent = "";
+    if (!computers.length) rows.innerHTML = '<tr><td class="empty-state" colspan="7">Carregando computadores…</td></tr>';
     try {
       const search = new URLSearchParams();
       if (searchInput.value.trim()) search.set("search", searchInput.value.trim());
@@ -117,7 +196,7 @@
     }
     rows.innerHTML = computers.map((computer) => `
       <tr data-id="${computer.id}" class="${selectedId === computer.id ? "selected" : ""}" tabindex="0" aria-label="Detalhes de ${escapeHtml(computer.hostname)}">
-        <td><span class="hostname">${escapeHtml(computer.hostname)}</span><span class="cell-subtle">${escapeHtml(computer.agent_id.slice(0, 8))}</span></td>
+        <td><span class="hostname">${escapeHtml(computer.display_name || computer.hostname)}</span><span class="cell-subtle">${escapeHtml(computer.agent_id.slice(0, 8))}</span></td>
         <td>${escapeHtml(computer.logged_user || "Não informado")}</td>
         <td>${escapeHtml(computer.os_name || "Não informado")}<span class="cell-subtle">${escapeHtml(computer.agent_version ? `Agente ${computer.agent_version}` : "")}</span></td>
         <td><span class="status ${escapeHtml(computer.authorization_status)}">${escapeHtml(authorizationLabel(computer.authorization_status))}</span></td>
@@ -125,6 +204,7 @@
         <td><span class="status ${computer.channel_connected ? "channel-active" : "channel-inactive"}">${computer.channel_connected ? "Conectado" : "Desconectado"}</span></td>
         <td>${escapeHtml(formatTime(computer.last_seen))}</td>
       </tr>`).join("");
+    loadAdminTools();
     rows.querySelectorAll("tr[data-id]").forEach((row) => {
       const select = () => loadDetail(Number(row.dataset.id));
       row.addEventListener("click", select);
@@ -140,7 +220,7 @@
   }
 
   function authorizationLabel(status) {
-    return ({ pending: "Pending", authorized: "Authorized", revoked: "Revoked" })[status] || "Pending";
+    return ({ pending: "Pendente de aprovação", authorized: "Autorizado", revoked: "Revogado" })[status] || "Pending";
   }
 
   async function changeAuthorization(id, action) {
@@ -164,6 +244,7 @@
   async function loadDetail(id) {
     if (screenComputerId !== null && screenComputerId !== id) closeScreenViewer();
     selectedId = id;
+    detailPanel.innerHTML = '<div class="detail-placeholder"><span class="detail-symbol" aria-hidden="true">…</span><h2>Carregando equipamento</h2><p>Buscando os dados mais recentes.</p></div>';
     rows.querySelectorAll("tr[data-id]").forEach((row) => row.classList.toggle("selected", Number(row.dataset.id) === id));
     try {
       const result = await api(`/api/v1/admin/computers/${id}`);
@@ -189,7 +270,7 @@
       && ["idle", "error"].includes(controlState);
     const screenFrame = screenFrameData
       ? `<img class="screen-frame" src="data:image/jpeg;base64,${screenFrameData}" alt="Tela de ${escapeHtml(computer.hostname)}">`
-      : `<div class="screen-placeholder">Aguardando início da visualização</div>`;
+      : `<div class="screen-placeholder">Aguardando a visualização</div>`;
     const ramModules = (memory.modules || []).map((module) => `
       <div class="hardware-item"><strong>${escapeHtml(formatBytes(module.capacity_bytes))} · ${escapeHtml(module.type)}</strong>
       <span>${escapeHtml(module.speed_mhz ? `${module.speed_mhz} MHz` : "Velocidade não informada")} · ${escapeHtml(module.manufacturer || "Fabricante não informado")}</span></div>`).join("");
@@ -208,7 +289,7 @@
     detailPanel.innerHTML = `
       <header class="detail-header"><div class="detail-header-top"><div><span class="eyebrow">EQUIPAMENTO</span><h2>${escapeHtml(computer.hostname)}</h2><div class="detail-meta">${escapeHtml(computer.agent_id)}</div></div>
       <div class="detail-statuses"><span class="status ${escapeHtml(computer.authorization_status)}">${escapeHtml(authorizationLabel(computer.authorization_status))}</span><span class="status ${computer.online ? "online" : "offline"}">${computer.online ? "Online" : "Offline"}</span><span class="status ${computer.channel_connected ? "channel-active" : "channel-inactive"}">${computer.channel_connected ? "Canal conectado" : "Canal desconectado"}</span></div></div>
-      <div class="detail-actions">${authorizationAction}</div></header>
+      <div class="detail-actions">${authorizationAction}<button type="button" data-rename-computer>Editar nome</button></div></header>
       ${section("SISTEMA", detailRow("Usuário", computer.logged_user) + detailRow("Sistema", computer.os_name) + detailRow("Versão", computer.os_version) + detailRow("Arquitetura", system.architecture) + detailRow("Uptime", system.uptime_seconds ? `${Math.floor(system.uptime_seconds / 86400)} dias` : null) + detailRow("Último contato", formatTime(computer.last_seen)) + detailRow("Canal persistente", computer.channel_connected ? "Conectado" : "Desconectado") + detailRow("Conectado em", formatTime(computer.channel_connected_at)) + detailRow("Último heartbeat", formatTime(computer.channel_last_heartbeat)))}
       ${section("PROCESSADOR", detailRow("Modelo", cpu.model) + detailRow("Núcleos físicos", cpu.physical_cores) + detailRow("Núcleos lógicos", cpu.logical_cores))}
       ${section("MEMÓRIA", detailRow("Total", formatBytes(memory.total_bytes)) + (ramModules || `<div class="hardware-item"><span>Detalhes individuais indisponíveis.</span></div>`))}
@@ -216,7 +297,8 @@
       ${gpus ? section("VÍDEO", gpus) : ""}
       ${section("PLACA-MÃE E BIOS", detailRow("Fabricante", board.manufacturer) + detailRow("Modelo", board.model) + detailRow("Serial placa-mãe", board.serial) + detailRow("BIOS", bios.version) + detailRow("Serial BIOS", bios.serial))}
       ${section("VISUALIZAÇÃO DA TELA", `<div class="screen-meta"><span>Máquina: <strong>${escapeHtml(computer.hostname)}</strong></span><span>Canal: <strong>${computer.channel_connected ? "Conectado" : "Desconectado"}</strong></span><span>Transmissão: <strong data-screen-status>${escapeHtml(screenStateLabel())}</strong></span><span>Último frame: <strong data-screen-last-frame>${escapeHtml(formatTime(screenLastFrameAt))}</strong></span></div><div class="screen-viewer" data-screen-viewer><div class="screen-actions"><button class="screen-button" type="button" data-screen-action="start" ${!canStartScreen || screenBusy ? "disabled" : ""}>Solicitar acesso</button><button class="screen-button screen-stop-button" type="button" data-screen-action="stop" ${!screenBusy || screenState === "connecting" ? "disabled" : ""}>Parar</button><button class="screen-button" type="button" data-screen-action="control-start" ${!canStartControl ? "disabled" : ""}>Iniciar controle</button><button class="screen-button screen-stop-button" type="button" data-screen-action="control-stop" ${controlState === "idle" || controlState === "error" ? "disabled" : ""}>Encerrar controle</button><button class="screen-button screen-fullscreen-button" type="button" data-screen-action="fullscreen" ${screenState !== "streaming" ? "disabled" : ""}>Tela cheia</button><span class="control-status" data-control-status>${escapeHtml(controlStateLabel())}</span><span class="fullscreen-status" data-fullscreen-status>Janela</span></div><p class="control-error" data-control-error role="status">${escapeHtml(controlErrorMessage)}</p><div class="screen-frame-wrap" data-screen-frame tabindex="0" aria-label="Visualização remota de ${escapeHtml(computer.hostname)}">${screenFrame}</div></div><p class="screen-fullscreen-error" data-screen-fullscreen-error role="status"></p><p class="screen-hint">O usuário do computador precisa aceitar a solicitação antes de a tela ser compartilhada.</p>`)}
-      ${section("REDE", detailRow("Gateways", (inventory.network?.gateways || []).join(", ")) + detailRow("DNS", (inventory.network?.dns_servers || []).join(", ")) + (network || `<div class="hardware-item"><span>Interfaces não disponíveis.</span></div>`))}`;
+      ${section("REDE", detailRow("Gateways", (inventory.network?.gateways || []).join(", ")) + detailRow("DNS", (inventory.network?.dns_servers || []).join(", ")) + (network || `<div class="hardware-item"><span>Interfaces não disponíveis.</span></div>`))}
+      ${section("CHAT COM O CLIENTE", `<div class="chat-box"><div data-chat-messages>Carregando mensagens…</div><div class="chat-compose"><input data-chat-input maxlength="2000" placeholder="Mensagem para o cliente"><button type="button" data-chat-send>Enviar</button></div></div>`)}`;
     detailPanel.querySelector("[data-authorization-action]")?.addEventListener("click", (event) => {
       changeAuthorization(computer.id, event.currentTarget.dataset.authorizationAction);
     });
@@ -228,6 +310,52 @@
     detailPanel.querySelector('[data-screen-action="control-stop"]')?.addEventListener("click", stopRemoteControl);
     detailPanel.querySelector('[data-screen-action="fullscreen"]')?.addEventListener("click", toggleScreenFullscreen);
     bindScreenInput();
+    async function loadChat() {
+      try {
+        const messages = await api(`/api/v1/admin/computers/${computer.id}/messages`);
+        const box = detailPanel.querySelector('[data-chat-messages]');
+        if (!box) return;
+        const ordered = messages.slice(-40);
+        const newestId = ordered.length ? Number(ordered[ordered.length - 1].id) : 0;
+        const hadNewClientMessage = newestId > chatLastMessageId && ordered.some((m) => Number(m.id) > chatLastMessageId && m.sender === 'client');
+        chatLastMessageId = Math.max(chatLastMessageId, newestId);
+        box.innerHTML = ordered.map(m => `
+          <div class="chat-message ${m.sender === 'technician' ? 'chat-message-out' : 'chat-message-in'}">
+            <div class="chat-message-head"><strong>${m.sender === 'technician' ? 'Você · TI' : 'Cliente'}</strong><span>${escapeHtml(formatTime(m.created_at))}</span></div>
+            <div class="chat-message-body">${escapeHtml(m.message)}</div>
+          </div>`).join('') || '<div class="chat-empty">Nenhuma mensagem ainda.</div>';
+        if (hadNewClientMessage) {
+          box.classList.remove('chat-updated');
+          void box.offsetWidth;
+          box.classList.add('chat-updated');
+        }
+        box.scrollTop = box.scrollHeight;
+      } catch (e) {
+        // Keep the chat visible if a transient polling request fails.
+      }
+    }
+    detailPanel.querySelector('[data-chat-send]')?.addEventListener('click', async () => {
+      const input = detailPanel.querySelector('[data-chat-input]');
+      const message = input?.value.trim();
+      if (!message) return;
+      try {
+        await api(`/api/v1/admin/computers/${computer.id}/messages?message=${encodeURIComponent(message)}`, {method:'POST'});
+        input.value = '';
+        await loadChat();
+      } catch(e) { globalError.textContent = e.message; }
+    });
+    chatLastMessageId = 0;
+    if (chatPollTimer !== null) clearInterval(chatPollTimer);
+    loadChat();
+    chatPollTimer = setInterval(() => {
+      if (selectedId === computer.id && document.visibilityState !== 'hidden') loadChat();
+    }, 1200);
+    loadChat();
+    detailPanel.querySelector("[data-rename-computer]")?.addEventListener("click", async () => {
+      const name = prompt("Nome exibido no Prefeitura Remote:", computer.display_name || computer.hostname);
+      if (!name) return;
+      try { await api(`/api/v1/admin/computers/${computer.id}/name?name=${encodeURIComponent(name)}`, {method:"PATCH"}); await loadComputers(); } catch (error) { globalError.textContent = error.message; }
+    });
     updateFullscreenButton();
   }
 
@@ -424,21 +552,47 @@
     const error = detailPanel.querySelector("[data-screen-fullscreen-error]");
     if (!viewer) return;
     if (error) error.textContent = "";
-    console.info("[screen-fullscreen] click", {
-      enabled: document.fullscreenEnabled,
-      supported: typeof viewer.requestFullscreen === "function",
-    });
     try {
+      if (!document.fullscreenEnabled) throw new Error("Seu navegador não permite tela cheia nesta conexão.");
       if (document.fullscreenElement === viewer) await document.exitFullscreen();
       else await viewer.requestFullscreen();
     } catch (reason) {
-      console.error("[screen-fullscreen] rejected", {
-        name: reason?.name || "UnknownError",
-        message: reason?.message || "No rejection message",
-        enabled: document.fullscreenEnabled,
-        secureContext: window.isSecureContext,
-      });
-      if (error) error.textContent = `Tela cheia recusada: ${reason?.name || "erro do navegador"}`;
+      if (error) error.textContent = reason?.message || "Não foi possível abrir a tela cheia.";
+    }
+  }
+
+  async function requestControlConsent(computer) {
+    if (controlConsentPollTimer !== null) clearInterval(controlConsentPollTimer);
+    controlConsentRequestId = null;
+    controlErrorMessage = "Aguardando a confirmação do usuário para gerenciamento";
+    updateControlControls();
+    try {
+      const response = await api(`/api/v1/admin/computers/${computer.id}/screen/access-request?mode=control`, { method: "POST" });
+      controlConsentRequestId = response.request_id;
+      controlConsentPollTimer = setInterval(async () => {
+        try {
+          const result = await api(`/api/v1/admin/computers/${computer.id}/screen/access-request/${encodeURIComponent(controlConsentRequestId)}`);
+          if (result.status === "approved") {
+            clearInterval(controlConsentPollTimer); controlConsentPollTimer = null; controlConsentRequestId = null;
+            if (screenSocket?.readyState === WebSocket.OPEN) {
+              controlState = "starting";
+              controlErrorMessage = "";
+              updateControlControls();
+              screenSocket.send(JSON.stringify({ type: "control.start" }));
+            }
+          } else if (["rejected", "expired", "cancelled"].includes(result.status)) {
+            clearInterval(controlConsentPollTimer); controlConsentPollTimer = null; controlConsentRequestId = null;
+            controlState = "error";
+            controlErrorMessage = result.status === "rejected" ? "O usuário recusou o gerenciamento." : "A solicitação de gerenciamento expirou.";
+            updateControlControls();
+          }
+        } catch (error) {
+          clearInterval(controlConsentPollTimer); controlConsentPollTimer = null; controlConsentRequestId = null;
+          controlState = "error"; controlErrorMessage = error.message; updateControlControls();
+        }
+      }, 800);
+    } catch (error) {
+      controlState = "error"; controlErrorMessage = error.message; updateControlControls();
     }
   }
 
@@ -449,15 +603,16 @@
       || screenState !== "streaming" || screenSocket?.readyState !== WebSocket.OPEN
       || !["idle", "error"].includes(controlState)
     ) return;
-    if (!window.confirm(`Iniciar o controle de mouse e teclado em ${computer.hostname}?`)) return;
-    controlState = "starting";
-    controlErrorMessage = "";
-    console.info("[remote-control] start requested");
-    updateControlControls();
-    screenSocket.send(JSON.stringify({ type: "control.start" }));
+    if (!window.confirm(`Solicitar gerenciamento de ${computer.hostname}? O usuário precisará confirmar no computador.`)) return;
+    await requestControlConsent(computer);
   }
 
   function stopRemoteControl() {
+    if (controlConsentPollTimer !== null) { clearInterval(controlConsentPollTimer); controlConsentPollTimer = null; }
+    if (controlConsentRequestId && screenComputerId !== null) {
+      api(`/api/v1/admin/computers/${screenComputerId}/screen/access-request/${encodeURIComponent(controlConsentRequestId)}/cancel`, { method: "POST" }).catch(() => {});
+      controlConsentRequestId = null;
+    }
     if (!screenSocket || screenSocket.readyState !== WebSocket.OPEN
       || !["starting", "active"].includes(controlState)) return;
     releaseHeldInputs();
@@ -519,7 +674,7 @@
     screenRemoteHeight = 0;
     clearHeldInputState();
     const frameWrap = detailPanel.querySelector("[data-screen-frame]");
-    if (frameWrap) frameWrap.innerHTML = '<div class="screen-placeholder">Aguardando aprovação do usuário no computador</div>';
+    if (frameWrap) frameWrap.innerHTML = '<div class="screen-placeholder">Aguardando a confirmação no computador</div>';
     updateScreenStatus();
     try {
       const requestResult = await api(`/api/v1/admin/computers/${computer.id}/screen/access-request`, { method: "POST" });
@@ -553,7 +708,7 @@
                 screenState = message.accepted ? "streaming" : "error";
                 screenRemoteWidth = Number.isInteger(message.screen_width) ? message.screen_width : 0;
                 screenRemoteHeight = Number.isInteger(message.screen_height) ? message.screen_height : 0;
-                updateScreenStatus(message.accepted ? "Transmitindo" : `Indisponível: ${message.reason || "captura recusada"}`);
+                updateScreenStatus(message.accepted ? "Transmitindo" : `Não foi possível iniciar: ${message.reason || "solicitação recusada"}`);
               } else if (message.type === "screen.frame" && typeof message.data === "string") {
                 screenLastFrameAt = new Date().toISOString();
                 screenState = "streaming";
@@ -573,10 +728,6 @@
                 }).catch(() => {});
                 updateScreenStatus("Transmitindo");
               } else if (message.type === "control.start_ack") {
-                console.info("[remote-control] start ack", {
-                  accepted: message.accepted === true,
-                  reason: message.reason || "accepted",
-                });
                 if (message.accepted === true
                   && Number.isInteger(message.screen_width) && Number.isInteger(message.screen_height)
                   && message.screen_width === screenRemoteWidth && message.screen_height === screenRemoteHeight) {
@@ -590,10 +741,9 @@
                   if (message.accepted === true && screenSocket === socket) {
                     socket.send(JSON.stringify({ type: "control.stop" }));
                   }
-                  updateScreenStatus("Controle não iniciado");
+                  updateScreenStatus("O controle não foi iniciado");
                 }
               } else if (message.type === "control.stop_ack") {
-                console.info("[remote-control] stop ack", { reason: message.reason || "operator_request" });
                 controlState = "idle";
                 controlErrorMessage = message.reason && message.reason !== "operator_request"
                   ? `Encerrado: ${message.reason}` : "";
@@ -610,7 +760,6 @@
             });
             socket.addEventListener("close", (event) => {
               if (screenSocket !== socket) return;
-              console.warn("[screen-viewer] websocket closed", { code: event.code, reason: event.reason || "no_reason" });
               screenSocket = null;
               screenComputerId = null;
               screenState = "stopped";
@@ -620,7 +769,6 @@
             });
             socket.addEventListener("error", () => {
               if (screenSocket !== socket) return;
-              console.error("[screen-viewer] websocket error");
               screenState = "error";
               controlState = "idle";
               clearHeldInputState();
@@ -684,6 +832,11 @@
   function closeScreenViewer() {
     if (screenConsentPollTimer !== null) clearTimeout(screenConsentPollTimer);
     screenConsentPollTimer = null;
+    if (controlConsentPollTimer !== null) { clearInterval(controlConsentPollTimer); controlConsentPollTimer = null; }
+    if (controlConsentRequestId && screenComputerId !== null) {
+      api(`/api/v1/admin/computers/${screenComputerId}/screen/access-request/${encodeURIComponent(controlConsentRequestId)}/cancel`, { method: "POST" }).catch(() => {});
+      controlConsentRequestId = null;
+    }
     if (screenConsentRequestId && screenComputerId !== null) {
       api(`/api/v1/admin/computers/${screenComputerId}/screen/access-request/${encodeURIComponent(screenConsentRequestId)}/cancel`, { method: "POST" }).catch(() => {});
     }
@@ -703,13 +856,70 @@
     if (socket && socket.readyState < WebSocket.CLOSING) socket.close(1000, "viewer mudou de máquina");
   }
 
+  async function loadAdminTools() {
+    const techBox=document.querySelector('#technician-list'), ticketBox=document.querySelector('#ticket-list');
+    if(!techBox||!ticketBox)return;
+    try {
+      const [techs,tickets]=await Promise.all([api('/api/v1/admin/technicians'),api('/api/v1/admin/tickets')]);
+      techBox.innerHTML=techs.map(t=>`<div class="tool-item"><strong>${escapeHtml(t.display_name)}</strong> · ${escapeHtml(t.username)} ${t.authorized?'':'(revogado)'}</div>`).join('')||'<p>Nenhum técnico cadastrado.</p>';
+      ticketBox.innerHTML=tickets.slice(0,12).map(t=>`<div class="tool-item"><strong>#${t.id} ${escapeHtml(t.title)}</strong><br>${escapeHtml(t.status)} · ${escapeHtml(t.priority)}</div>`).join('')||'<p>Nenhum chamado.</p>';
+    } catch(e) {}
+  }
+  function requestTechnicianAccount() {
+    return new Promise((resolve) => {
+      const dialog = document.createElement('dialog');
+      dialog.setAttribute('aria-label', 'Cadastrar técnico');
+      const form = document.createElement('form');
+      form.innerHTML = '<h2>Cadastrar técnico</h2><p><label>Usuário <input name="username" required minlength="3" maxlength="100" autocomplete="off"></label></p><p><label>Nome <input name="display_name" required maxlength="160" autocomplete="off"></label></p><p><label>Senha <input name="password" type="password" required minlength="10" maxlength="1024" autocomplete="new-password"></label></p><button type="submit">Criar conta</button> <button type="button" data-cancel>Cancelar</button>';
+      let result = null;
+      form.addEventListener('submit', (event) => {
+        event.preventDefault();
+        if (!form.reportValidity()) return;
+        result = Object.fromEntries(new FormData(form));
+        form.reset();
+        dialog.close();
+      });
+      form.querySelector('[data-cancel]').addEventListener('click', () => dialog.close());
+      dialog.addEventListener('close', () => {
+        form.reset();
+        dialog.remove();
+        resolve(result);
+      }, { once: true });
+      dialog.append(form);
+      document.body.append(dialog);
+      dialog.showModal();
+    });
+  }
+  document.querySelector('#new-tech-button')?.addEventListener('click', async()=>{
+    const account = await requestTechnicianAccount();
+    if (!account) return;
+    try{await api('/api/v1/admin/technicians',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(account)});loadAdminTools();alert('Conta criada.');}catch(e){alert(e.message)}
+  });
+  document.querySelector('#new-ticket-button')?.addEventListener('click', async()=>{
+    const title=prompt('Título do chamado:'); if(!title)return; const description=prompt('Descrição:'); if(!description)return; const priority=prompt('Prioridade: low, normal, high ou urgent','normal')||'normal';
+    try{await api(`/api/v1/admin/tickets?title=${encodeURIComponent(title)}&description=${encodeURIComponent(description)}&priority=${encodeURIComponent(priority)}`,{method:'POST'});loadAdminTools();alert('Chamado criado.');}catch(e){alert(e.message)}
+  });
+
   loginForm.addEventListener("submit", async (event) => {
     event.preventDefault();
-    sessionStorage.setItem("dashboard_token", tokenInput.value.trim());
     loginError.textContent = "";
+    const username = usernameInput.value.trim();
+    const password = passwordInput.value;
+    const adminToken = tokenInput.value.trim();
     try {
-      const response = await fetch("/api/v1/computers", { headers: authHeaders() });
-      if (!response.ok) throw new Error(response.status === 401 ? "Token inválido." : "Não foi possível acessar o servidor.");
+      if (username && password) {
+        const response = await fetch('/api/v1/auth/login', { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username, password }) });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(response.status === 401 ? "Usuário ou senha inválidos." : "Não foi possível entrar agora.");
+        sessionStorage.setItem("dashboard_token", data.token);
+        passwordInput.value = "";
+      } else if (adminToken) {
+        const response = await fetch("/api/v1/admin/computers", { headers: { Authorization: `Bearer ${adminToken}` } });
+        if (!response.ok) throw new Error(response.status === 401 ? "Credencial administrativa inválida." : "Não foi possível acessar o painel.");
+        sessionStorage.setItem("dashboard_token", adminToken);
+      } else {
+        throw new Error("Informe seu usuário e senha ou a credencial administrativa.");
+      }
       showApp();
     } catch (error) {
       sessionStorage.removeItem("dashboard_token");
@@ -717,20 +927,36 @@
     }
   });
 
-  logoutButton.addEventListener("click", () => {
+  logoutButton.addEventListener("click", async () => {
     closeScreenViewer();
+    // Capture the current credential before clearing browser state. Network
+    // failure must not keep the local dashboard open.
+    const logoutHeaders = authHeaders();
     sessionStorage.removeItem("dashboard_token");
     computers = [];
     selectedId = null;
     searchInput.value = "";
     showLogin();
+    await fetch('/api/v1/auth/logout', { method: 'POST', headers: logoutHeaders }).catch(() => {});
   });
   searchInput.addEventListener("input", () => {
     clearTimeout(searchTimer);
     searchTimer = setTimeout(loadComputers, 180);
   });
   authorizationFilter.addEventListener("change", loadComputers);
-  document.querySelector("#refresh-button").addEventListener("click", loadComputers);
+  document.querySelector("#refresh-button").addEventListener("click", async () => {
+    const button = document.querySelector("#refresh-button");
+    if (!button || button.disabled) return;
+    button.disabled = true;
+    button.classList.add("is-refreshing");
+    try {
+      await Promise.all([loadComputers(), loadAdminTools()]);
+      document.querySelector("#updated-at").textContent = `Atualizado ${formatTime(new Date().toISOString())}`;
+    } finally {
+      button.disabled = false;
+      button.classList.remove("is-refreshing");
+    }
+  });
   document.addEventListener("keydown", (event) => {
     if (!event.defaultPrevented && event.key === "/"
       && !["INPUT", "TEXTAREA"].includes(document.activeElement.tagName)) {
@@ -739,9 +965,6 @@
     }
   });
   document.addEventListener("fullscreenchange", () => {
-    console.info("[screen-fullscreen] changed", {
-      active: document.fullscreenElement !== null,
-    });
     updateFullscreenButton();
   });
   document.addEventListener("visibilitychange", () => {

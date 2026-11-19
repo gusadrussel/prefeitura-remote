@@ -8,11 +8,15 @@ import logging
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from server.database.models import Computer
 from server.routes.websocket import _is_secure_or_loopback, _websocket_connection_allowed
 from server.services.agent_credentials import has_active_agent_credential
 from server.services.remote_control import valid_viewer_message
+from server.services.task_cleanup import cancel_tasks
+from server.services.remote_consent import technician_session_valid
+from server.services.audit import audit_available
 
 LOGGER = logging.getLogger("prefeitura_remote.screen")
 screen_router = APIRouter()
@@ -58,6 +62,7 @@ def _valid_jpeg_frame(message: dict, settings) -> bool:
         or width > settings.screen_max_width
         or height > settings.screen_max_height
         or len(data) > (settings.screen_max_frame_bytes + 2) // 3 * 4
+        
     ):
         return False
     try:
@@ -83,6 +88,9 @@ async def screen_viewer(websocket: WebSocket, computer_id: int) -> None:
     if not _websocket_connection_allowed(websocket, "viewer", str(computer_id)):
         await websocket.close(code=1013, reason="Limite de conexões atingido")
         return
+    if not audit_available(websocket.app):
+        await _close(websocket,1013,'Auditoria indisponível')
+        return
 
     ticket = websocket.query_params.get("ticket", "")
     streams = websocket.app.state.screen_streams
@@ -92,7 +100,12 @@ async def screen_viewer(websocket: WebSocket, computer_id: int) -> None:
         await _close(websocket, 1008, "Ticket de visualização inválido ou expirado")
         return
     agent_id = consumed
-    if not _is_authorized(websocket, computer_id, agent_id):
+    consents = websocket.app.state.remote_consent
+    consent = consents.for_ticket(ticket, computer_id)
+    if consent is None or consent.agent_id != agent_id or not technician_session_valid(websocket.app, consent):
+        await _close(websocket, 1008, "Consentimento de visualização inválido")
+        return
+    if not await run_in_threadpool(_is_authorized, websocket, computer_id, agent_id):
         await _close(websocket, 1008, "Computador não autorizado")
         return
     connection = agent_connections.get(agent_id)
@@ -102,15 +115,20 @@ async def screen_viewer(websocket: WebSocket, computer_id: int) -> None:
 
     viewer = streams.attach(agent_id, computer_id)
     if viewer is None:
-        await _close(websocket, 1008, "Já existe um viewer para esta máquina")
+        await _close(websocket, 1008, "Viewer indisponível ou capacidade de visualização atingida")
         return
+    viewer.view_request_id = consent.request_id
+    viewer.principal = consent.principal
+    viewer.principal_type = "bootstrap" if consent.bootstrap else "technician"
+        
 
-    await websocket.accept()
-    receive_task = asyncio.create_task(websocket.receive_json())
-    control_task = asyncio.create_task(viewer.control_queue.get())
-    frame_task = asyncio.create_task(viewer.frame_queue.get())
-    disconnected_task = asyncio.create_task(viewer.disconnected.wait())
+    receive_task = control_task = frame_task = disconnected_task = None
     try:
+        await websocket.accept()
+        receive_task = asyncio.create_task(websocket.receive_json())
+        control_task = asyncio.create_task(viewer.control_queue.get())
+        frame_task = asyncio.create_task(viewer.frame_queue.get())
+        disconnected_task = asyncio.create_task(viewer.disconnected.wait())
         while True:
             done, _ = await asyncio.wait(
                 {receive_task, control_task, frame_task, disconnected_task},
@@ -118,6 +136,9 @@ async def screen_viewer(websocket: WebSocket, computer_id: int) -> None:
             )
             if disconnected_task in done and viewer.disconnected.is_set():
                 await _close(websocket, 1001, "Canal do agente desconectado")
+                break
+            if not technician_session_valid(websocket.app, consents.get(viewer.view_request_id)):
+                await _close(websocket, 1008, "Sessão do técnico inválida ou encerrada")
                 break
             if receive_task in done:
                 message = receive_task.result()
@@ -127,8 +148,16 @@ async def screen_viewer(websocket: WebSocket, computer_id: int) -> None:
                     break
 
                 message_type = message.get("type")
+                if message_type in {'screen.start','control.start','control.input'} and not audit_available(websocket.app):
+                    await _close(websocket,1011,'Auditoria indisponível')
+                    break
                 if message_type == "screen.start":
-                    if not _is_authorized(websocket, computer_id, agent_id):
+                    if not consents.claim(viewer.view_request_id, "view"):
+                        await _close(websocket, 1008, "Consentimento de visualização ausente ou expirado")
+                        break
+                    if (not await run_in_threadpool(_is_authorized, websocket, computer_id, agent_id)
+                            or not consents.active(viewer.view_request_id, 'view')
+                            or not technician_session_valid(websocket.app, consents.get(viewer.view_request_id))):
                         streams.publish_control(
                             agent_id,
                             {"type": "screen.start_ack", "accepted": False, "reason": "not_authorized"},
@@ -162,6 +191,7 @@ async def screen_viewer(websocket: WebSocket, computer_id: int) -> None:
                             {"type": "screen.start_ack", "accepted": False, "reason": "agent_busy"},
                         )
                 elif message_type == "screen.stop":
+                    consents.end(viewer.view_request_id, "screen_stopped")
                     if streams.request_control_stop(viewer):
                         if not agent_connections.send_urgent(agent_id, {"type": "screen.stop"}):
                             streams.agent_control_stopped(
@@ -185,7 +215,8 @@ async def screen_viewer(websocket: WebSocket, computer_id: int) -> None:
                             agent_id, {"type": "screen.stop_ack", "stopped": True}
                         )
                 elif message_type == "control.start":
-                    if not _is_authorized(websocket, computer_id, agent_id):
+                    if (not await run_in_threadpool(_is_authorized, websocket, computer_id, agent_id)
+                            or not technician_session_valid(websocket.app, consents.get(viewer.view_request_id))):
                         LOGGER.warning(
                             "remote_control_start_rejected reason=not_authorized computer_id=%s agent_id=%s",
                             computer_id,
@@ -216,6 +247,11 @@ async def screen_viewer(websocket: WebSocket, computer_id: int) -> None:
                             },
                         )
                         continue
+                    if viewer.state == "streaming" and viewer.control_state == "idle":
+                        viewer.control_request_id = consents.claim_control(viewer.view_request_id)
+                        if viewer.control_request_id is None:
+                            streams.publish_control(agent_id, {"type":"control.start_ack", "accepted":False, "reason":"not_authorized"})
+                            continue
                     if not streams.request_control_start(viewer):
                         reason = (
                             "screen_not_running"
@@ -248,6 +284,7 @@ async def screen_viewer(websocket: WebSocket, computer_id: int) -> None:
                             },
                         )
                 elif message_type == "control.stop":
+                    consents.end(viewer.control_request_id, "control_stopped")
                     if streams.request_control_stop(viewer):
                         if not agent_connections.send_urgent(agent_id, {"type": "control.stop"}):
                             streams.agent_control_stopped(
@@ -264,7 +301,8 @@ async def screen_viewer(websocket: WebSocket, computer_id: int) -> None:
                                 agent_id, {"type": "control.stop_ack", "stopped": True}
                             )
                 elif message_type == "control.input":
-                    if not _is_authorized(websocket, computer_id, agent_id):
+                    if (not await run_in_threadpool(_is_authorized, websocket, computer_id, agent_id)
+                            or not technician_session_valid(websocket.app, consents.get(viewer.view_request_id))):
                         agent_connections.send_urgent(
                             agent_id,
                             {"type": "session.stop", "reason": "channel_unavailable"},
@@ -276,6 +314,8 @@ async def screen_viewer(websocket: WebSocket, computer_id: int) -> None:
                     if (
                         viewer.state != "streaming"
                         or viewer.control_state != "active"
+                        or not consents.active(viewer.view_request_id, "view")
+                        or not consents.active(viewer.control_request_id, "control")
                         or not current
                         or not current.connected
                     ):
@@ -305,18 +345,17 @@ async def screen_viewer(websocket: WebSocket, computer_id: int) -> None:
                 if viewer.state == "streaming":
                     await websocket.send_json(frame)
                 frame_task = asyncio.create_task(viewer.frame_queue.get())
-    except asyncio.CancelledError:
+    except asyncio.CancelledError:  
         LOGGER.debug("Viewer cancelado para a máquina %s", computer_id)
+        raise
     except WebSocketDisconnect:
         pass
     except (RuntimeError, ValueError):
         LOGGER.exception("Erro no viewer da máquina %s", computer_id)
     finally:
-        for task in (receive_task, control_task, frame_task, disconnected_task):
-            task.cancel()
-        await asyncio.gather(
-            receive_task, control_task, frame_task, disconnected_task, return_exceptions=True
-        )
+        consents.end(viewer.view_request_id, "viewer_disconnected")
         should_stop = streams.detach_and_stop_agent(viewer, agent_connections)
         if should_stop:
             LOGGER.info("Captura encerrada após desconexão do viewer: %s", agent_id)
+        await cancel_tasks(receive_task, control_task, frame_task, disconnected_task)
+            

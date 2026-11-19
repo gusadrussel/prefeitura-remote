@@ -9,7 +9,7 @@ class DashboardFullscreenTests(unittest.TestCase):
     def test_fullscreen_state_is_independent_from_remote_control(self):
         source = DASHBOARD_SCRIPT.read_text(encoding="utf-8")
         handler_start = source.index("async function toggleScreenFullscreen()")
-        handler_end = source.index("async function startRemoteControl()", handler_start)
+        handler_end = source.index("async function requestControlConsent(computer)", handler_start)
         fullscreen_handler = source[handler_start:handler_end]
 
         self.assertNotIn("controlState", fullscreen_handler)
@@ -17,9 +17,9 @@ class DashboardFullscreenTests(unittest.TestCase):
         self.assertIn("document.exitFullscreen()", fullscreen_handler)
         self.assertIn("data-screen-action=\"fullscreen\"", source)
         self.assertIn('addEventListener("click", toggleScreenFullscreen)', source)
-        self.assertIn("console.error(\"[screen-fullscreen] rejected\"", fullscreen_handler)
+        self.assertNotIn("console.", fullscreen_handler)
         self.assertIn("document.fullscreenEnabled", fullscreen_handler)
-        self.assertIn('console.info("[screen-fullscreen] changed"', source)
+        self.assertNotIn("console.", source)
         self.assertLess(
             fullscreen_handler.index("viewer.requestFullscreen()"),
             fullscreen_handler.index("catch (reason)"),

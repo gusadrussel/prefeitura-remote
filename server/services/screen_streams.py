@@ -6,7 +6,9 @@ import secrets
 import time
 import uuid
 from dataclasses import dataclass, field
-from threading import Lock
+from threading import Lock, RLock
+from server.services.async_bridge import Mailbox, Signal, synchronized
+from server.services.audit import audit_event
 
 SCREEN_TICKET_TTL_SECONDS = 30
 MAX_PENDING_SCREEN_TICKETS = 1024
@@ -29,13 +31,13 @@ class ScreenViewerTicket:
 class ScreenViewer:
     agent_id: str
     computer_id: int
-    control_queue: asyncio.Queue[dict] = field(
-        default_factory=lambda: asyncio.Queue(maxsize=8)
+    control_queue: Mailbox = field(
+        default_factory=lambda: Mailbox(maxsize=8)
     )
-    frame_queue: asyncio.Queue[dict] = field(
-        default_factory=lambda: asyncio.Queue(maxsize=1)
+    frame_queue: Mailbox = field(
+        default_factory=lambda: Mailbox(maxsize=1)
     )
-    disconnected: asyncio.Event = field(default_factory=asyncio.Event)
+    disconnected: Signal = field(default_factory=Signal)
     state: str = "idle"
     dropped_frames: int = 0
     control_state: str = "idle"
@@ -43,10 +45,19 @@ class ScreenViewer:
     control_started: bool = False
     screen_width: int | None = None
     screen_height: int | None = None
+    view_request_id: str | None = None
+    control_request_id: str | None = None
+    principal: str = ""
+    principal_type: str = "unknown"
+    view_started: bool = False
 
 
 class ScreenStreamRegistry:
-    def __init__(self) -> None:
+    def __init__(self, max_viewers: int = 8) -> None:
+        if max_viewers < 1:
+            raise ValueError("Viewer capacity must be positive")
+        self._max_viewers = max_viewers
+        self._lock = RLock()
         self._tickets: dict[str, ScreenViewerTicket] = {}
         self._ticket_lock = Lock()
         self._viewers: dict[str, ScreenViewer] = {}
@@ -81,37 +92,46 @@ class ScreenStreamRegistry:
         for token in expired:
             self._tickets.pop(token, None)
 
+    @synchronized
     def attach(self, agent_id: str, computer_id: int) -> ScreenViewer | None:
         current = self._viewers.get(agent_id)
         if current is not None and not current.disconnected.is_set():
+            return None
+        if current is None and len(self._viewers) >= self._max_viewers:
             return None
         viewer = ScreenViewer(agent_id=agent_id, computer_id=computer_id)
         self._viewers[agent_id] = viewer
         return viewer
 
+    @synchronized
     def detach(self, viewer: ScreenViewer) -> bool:
         if self._viewers.get(viewer.agent_id) is not viewer:
             return False
         self._viewers.pop(viewer.agent_id, None)
         viewer.disconnected.set()
+        self.finish_view(viewer, "viewer_disconnected")
         self.finish_control(viewer, "viewer_disconnected")
         return viewer.state in {"starting", "streaming", "stopping"}
 
+    @synchronized
     def detach_and_stop_agent(self, viewer: ScreenViewer, agent_connections) -> bool:
         should_stop = self.detach(viewer)
         if should_stop:
             agent_connections.send_urgent(viewer.agent_id, {"type": "screen.stop"})
         return should_stop
 
+    @synchronized
     def get(self, agent_id: str) -> ScreenViewer | None:
         return self._viewers.get(agent_id)
 
+    @synchronized
     def request_start(self, viewer: ScreenViewer) -> bool:
         if viewer.state != "idle" or viewer.disconnected.is_set():
             return False
         viewer.state = "starting"
         return True
 
+    @synchronized
     def request_stop(self, viewer: ScreenViewer) -> bool:
         if viewer.state == "idle" or viewer.disconnected.is_set():
             return False
@@ -121,12 +141,9 @@ class ScreenStreamRegistry:
 
     @staticmethod
     def _discard_pending_frames(viewer: ScreenViewer) -> None:
-        while not viewer.frame_queue.empty():
-            try:
-                viewer.frame_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
+        viewer.frame_queue.clear()
 
+    @synchronized
     def publish_control(self, agent_id: str, message: dict) -> bool:
         viewer = self._viewers.get(agent_id)
         if viewer is None or viewer.disconnected.is_set():
@@ -138,19 +155,16 @@ class ScreenStreamRegistry:
             return False
         return True
 
+    @synchronized
     def publish_frame(self, agent_id: str, message: dict) -> bool:
         viewer = self._viewers.get(agent_id)
         if viewer is None or viewer.state != "streaming" or viewer.disconnected.is_set():
             return False
-        if viewer.frame_queue.full():
-            try:
-                viewer.frame_queue.get_nowait()
-                viewer.dropped_frames += 1
-            except asyncio.QueueEmpty:
-                pass
-        viewer.frame_queue.put_nowait(message)
+        if viewer.frame_queue.put_latest(message):
+            viewer.dropped_frames += 1
         return True
 
+    @synchronized
     def agent_started(self, agent_id: str, message: dict) -> bool:
         viewer = self._viewers.get(agent_id)
         if viewer is None or viewer.state != "starting":
@@ -158,13 +172,19 @@ class ScreenStreamRegistry:
         viewer.state = "streaming" if message.get("accepted") is True else "idle"
         viewer.screen_width = message.get("screen_width") if message.get("accepted") else None
         viewer.screen_height = message.get("screen_height") if message.get("accepted") else None
+        if message.get("accepted") is True:
+            viewer.view_started = True
+            audit_event("remote_view_started",principal=viewer.principal,principal_type=viewer.principal_type,
+                computer_id=viewer.computer_id,agent_id=viewer.agent_id,request_id=viewer.view_request_id)
         return self.publish_control(agent_id, message)
 
+    @synchronized
     def agent_stopped(self, agent_id: str, message: dict) -> bool:
         viewer = self._viewers.get(agent_id)
         if viewer is None:
             return False
         viewer.state = "idle"
+        self.finish_view(viewer, "screen_stopped")
         viewer.screen_width = None
         viewer.screen_height = None
         self._discard_pending_frames(viewer)
@@ -176,6 +196,7 @@ class ScreenStreamRegistry:
             )
         return self.publish_control(agent_id, message)
 
+    @synchronized
     def request_control_start(self, viewer: ScreenViewer) -> bool:
         if (
             viewer.state != "streaming"
@@ -188,6 +209,7 @@ class ScreenStreamRegistry:
         viewer.control_started = False
         return True
 
+    @synchronized
     def agent_control_started(self, agent_id: str, message: dict) -> bool:
         viewer = self._viewers.get(agent_id)
         if viewer is None or viewer.control_state not in {"starting", "stopping"}:
@@ -196,10 +218,13 @@ class ScreenStreamRegistry:
             viewer.control_started = True
             AUDIT_LOGGER.info(
                 "remote_control_started technician=%s computer_id=%s agent_id=%s session_id=%s",
-                TECHNICIAN_PRINCIPAL,
+                viewer.principal or TECHNICIAN_PRINCIPAL,
                 viewer.computer_id,
                 viewer.agent_id,
                 viewer.control_session_id,
+                extra={"audit_event":"remote_control_started","audit_fields":{
+                    "principal":viewer.principal or TECHNICIAN_PRINCIPAL,"principal_type":viewer.principal_type,
+                    "computer_id":viewer.computer_id,"agent_id":viewer.agent_id,"session_id":viewer.control_session_id}},
             )
             if (
                 message.get("screen_width") != viewer.screen_width
@@ -230,12 +255,14 @@ class ScreenStreamRegistry:
             self.finish_control(viewer, "start_rejected")
         return self.publish_control(agent_id, message)
 
+    @synchronized
     def request_control_stop(self, viewer: ScreenViewer) -> bool:
         if viewer.control_state not in {"starting", "active"} or viewer.disconnected.is_set():
             return False
         viewer.control_state = "stopping"
         return True
 
+    @synchronized
     def agent_control_stopped(self, agent_id: str, message: dict) -> bool:
         viewer = self._viewers.get(agent_id)
         if viewer is None:
@@ -245,25 +272,38 @@ class ScreenStreamRegistry:
         return self.publish_control(agent_id, message)
 
     @staticmethod
+    def finish_view(viewer: ScreenViewer, reason: str) -> None:
+        if viewer.view_started:
+            viewer.view_started = False
+            audit_event("remote_view_ended",principal=viewer.principal,principal_type=viewer.principal_type,
+                computer_id=viewer.computer_id,agent_id=viewer.agent_id,request_id=viewer.view_request_id,reason=reason)
+
+    @staticmethod
     def finish_control(viewer: ScreenViewer, reason: str) -> None:
         if viewer.control_session_id is not None and viewer.control_started:
             AUDIT_LOGGER.info(
                 "remote_control_ended technician=%s computer_id=%s agent_id=%s session_id=%s reason=%s",
-                TECHNICIAN_PRINCIPAL,
+                viewer.principal or TECHNICIAN_PRINCIPAL,
                 viewer.computer_id,
                 viewer.agent_id,
                 viewer.control_session_id,
                 reason,
+                extra={"audit_event":"remote_control_ended","audit_fields":{
+                    "principal":viewer.principal or TECHNICIAN_PRINCIPAL,"principal_type":viewer.principal_type,
+                    "computer_id":viewer.computer_id,"agent_id":viewer.agent_id,"session_id":viewer.control_session_id,"reason":reason}},
             )
         viewer.control_state = "idle"
         viewer.control_session_id = None
         viewer.control_started = False
 
+    @synchronized
     def agent_disconnected(self, agent_id: str) -> bool:
         viewer = self._viewers.get(agent_id)
         if viewer is None:
             return False
         viewer.state = "idle"
+        viewer.frame_queue.clear()
         viewer.disconnected.set()
+        self.finish_view(viewer, "agent_disconnected")
         self.finish_control(viewer, "agent_disconnected")
         return True

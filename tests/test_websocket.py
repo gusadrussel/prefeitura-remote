@@ -13,6 +13,62 @@ from server.routes.websocket import derive_agent_channel_credential
 
 
 class AgentWebSocketTests(unittest.TestCase):
+    def test_chat_rejects_nul_and_preserves_valid_messages(self):
+        self.app.state.settings = replace(self.app.state.settings, agent_heartbeat_timeout_seconds=5)
+        agent_id, computer_id = self._register_agent()
+        self._authorize(computer_id)
+        with self._connect(agent_id) as socket:
+            socket.send_json({'type':'hello','agent_id':agent_id})
+            self.assertEqual(socket.receive_json()['type'],'hello_ack')
+            socket.send_json({'type':'chat.message','message_id':1,'sender':'client','message':'Valid'})
+            socket.send_json({'type':'chat.message','message_id':2,'sender':'client','message':'bad\x00text'})
+            with self.assertRaises(WebSocketDisconnect) as closed:
+                socket.receive_json()
+            self.assertEqual(closed.exception.code,1003)
+        messages = self.client.get(f'/api/v1/admin/computers/{computer_id}/messages',headers=self.dashboard_headers).json()
+        self.assertEqual([row['message'] for row in messages],['Valid'])
+
+    def test_revoked_channel_cannot_persist_chat_before_next_heartbeat(self):
+        self.app.state.settings = replace(self.app.state.settings, agent_heartbeat_timeout_seconds=5)
+        agent_id, computer_id = self._register_agent()
+        self._authorize(computer_id)
+        credential = self._issue_individual_credential(agent_id)
+        with self._connect_with_credential(agent_id,credential) as socket:
+            socket.send_json({'type':'hello','agent_id':agent_id})
+            self.assertEqual(socket.receive_json()['type'],'hello_ack')
+            response = self.client.post(f'/api/v1/admin/agents/{agent_id}/credential',headers=self.dashboard_headers)
+            self.assertEqual(response.status_code,200)
+            self.assertEqual(socket.receive_json()['type'],'session.stop')
+            socket.send_json({'type':'chat.message','message_id':1,'sender':'client','message':'Must not persist'})
+            with self.assertRaises(WebSocketDisconnect) as closed:
+                socket.receive_json()
+            self.assertEqual(closed.exception.code,1008)
+        self.assertEqual(self.client.get(f'/api/v1/admin/computers/{computer_id}/messages',headers=self.dashboard_headers).json(),[])
+
+    def test_admin_rotation_stops_live_channel_before_next_heartbeat(self):
+        agent_id, computer_id = self._register_agent()
+        self._authorize(computer_id)
+        credential = self._issue_individual_credential(agent_id)
+        consent = self.app.state.remote_consent.create(agent_id,computer_id,"Synthetic")
+        with self._connect_with_credential(agent_id,credential) as socket:
+            socket.send_json({"type":"hello","agent_id":agent_id})
+            self.assertEqual(socket.receive_json()["type"],"hello_ack")
+            response = self.client.post(f"/api/v1/admin/agents/{agent_id}/credential",headers=self.dashboard_headers)
+            self.assertEqual(response.status_code,200)
+            replacement = response.json()["credential"]
+            self.assertEqual(socket.receive_json(),{"type":"session.stop","reason":"channel_unavailable"})
+            self.assertEqual(consent.status,"cancelled")
+            socket.send_json({"type":"disconnect"})
+            self.assertEqual(socket.receive_json()["type"],"disconnect_ack")
+        with self.assertRaises(WebSocketDisconnect):
+            with self._connect_with_credential(agent_id,credential):
+                pass
+        with self._connect_with_credential(agent_id,replacement) as socket:
+            socket.send_json({"type":"hello","agent_id":agent_id})
+            self.assertEqual(socket.receive_json()["type"],"hello_ack")
+            socket.send_json({"type":"disconnect"})
+            self.assertEqual(socket.receive_json()["type"],"disconnect_ack")
+
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         database_path = Path(self.temp_dir.name) / "websocket-test.db"

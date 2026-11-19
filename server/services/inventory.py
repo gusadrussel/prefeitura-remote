@@ -74,6 +74,7 @@ def computer_summary(
         "id": computer.id,
         "agent_id": computer.agent_id,
         "hostname": computer.hostname,
+        "display_name": computer.display_name or computer.hostname,
         "logged_user": computer.logged_user,
         "os_name": computer.os_name,
         "os_version": computer.os_version,

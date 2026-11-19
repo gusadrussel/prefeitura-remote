@@ -4,8 +4,10 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 import uuid
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 
 from fastapi.testclient import TestClient
 from PIL import Image
@@ -21,6 +23,48 @@ from server.provision_agent import provision_agent, revoke_agent_credential
 
 
 class ScreenApiTests(unittest.TestCase):
+    def test_account_named_dashboard_admin_cannot_take_bootstrap_consent(self):
+        payload = {"username":"dashboard-admin","display_name":"Test","password":"only-test-password"}
+        self.assertEqual(self.client.post('/api/v1/admin/technicians',json=payload,headers=self.dashboard_headers).status_code,200)
+        login = self.client.post('/api/v1/auth/login',json={"username":payload['username'],"password":payload['password']})
+        headers = {"Authorization":f"Bearer {login.json()['token']}"}
+        agent_id, computer_id = self._register("authorized")
+        self.app.state.agent_connections.connect(agent_id, computer_id)
+        ticket = self._issue_ticket(computer_id).json()['ticket']
+        consent = self.app.state.remote_consent.for_ticket(ticket, computer_id)
+        path = f'/api/v1/admin/computers/{computer_id}/screen/access-request/{consent.request_id}'
+        self.assertEqual(self.client.get(path,headers=headers).status_code,404)
+        self.assertEqual(self.client.post(path+'/cancel',headers=headers).status_code,404)
+        self.assertEqual(consent.status,'approved')
+
+    def test_parallel_consented_streams_recover_after_abrupt_agent_disconnect(self):
+        self.app.state.settings = replace(self.settings, agent_heartbeat_timeout_seconds=20)
+        jpeg = encode_rgb_frame(Image.new("RGB", (2,2), (1,2,3)).tobytes(), 2, 2)[0]
+        data = base64.b64encode(jpeg).decode("ascii")
+        def session(index):
+            agent_id, computer_id = self._register("authorized")
+            with self._agent_socket(agent_id) as agent:
+                agent.send_json({"type":"hello", "agent_id":agent_id})
+                self.assertEqual(agent.receive_json()["type"],"hello_ack")
+                with self._consented_view(agent, computer_id) as viewer:
+                    agent.send_json({"type":"screen.frame","format":"jpeg","data":data,
+                                     "width":2,"height":2,"sequence":index})
+                    self.assertEqual(viewer.receive_json()["sequence"],index)
+                    agent.close()
+                    with self.assertRaises(WebSocketDisconnect):
+                        viewer.receive_json()
+            self.assertIsNone(self.app.state.screen_streams.get(agent_id))
+            with self._agent_socket(agent_id) as recovered:
+                recovered.send_json({"type":"hello","agent_id":agent_id})
+                self.assertEqual(recovered.receive_json()["type"],"hello_ack")
+                recovered.send_json({"type":"disconnect"})
+                self.assertEqual(recovered.receive_json()["type"],"disconnect_ack")
+            self.assertFalse(self.app.state.agent_connections.get(agent_id).connected)
+            return agent_id
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            agents = list(pool.map(session, range(4)))
+        self.assertEqual(len(set(agents)),4)
+
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         database_path = Path(self.temp_dir.name) / "screen-test.db"
@@ -112,9 +156,101 @@ class ScreenApiTests(unittest.TestCase):
         try:
             row = computer.get(self.app.state.computer_model, computer_id)
             ticket, expires_in = self.app.state.screen_streams.issue_ticket(row.agent_id, computer_id)
+            # Registry fixture represents an agent's accepted view request. Full
+            # REST/WebSocket consent round trips are tested separately below.
+            consent = self.app.state.remote_consent.create(row.agent_id, computer_id, "Test", principal="dashboard-admin", bootstrap=True)
+            self.app.state.remote_consent.respond(consent.request_id, row.agent_id, computer_id, True)
+            self.app.state.remote_consent.attach_ticket(consent.request_id, ticket, expires_in)
             return SimpleNamespace(status_code=200, headers={}, json=lambda: {"ticket": ticket, "expires_in": expires_in}, text="")
         finally:
             computer.close()
+
+    def _approve_control(self, agent_id, computer_id):
+        viewer = self.app.state.screen_streams.get(agent_id)
+        consent = self.app.state.remote_consent.create(agent_id, computer_id, "Test", mode="control",
+                         principal="dashboard-admin", parent_id=viewer.view_request_id, bootstrap=True)
+        self.app.state.remote_consent.respond(consent.request_id, agent_id, computer_id, True)
+
+    def _approve_over_channel(self, agent_socket, computer_id, mode="view", accepted=True):
+        response = self.client.post(f"/api/v1/admin/computers/{computer_id}/screen/access-request?mode={mode}", headers=self.dashboard_headers)
+        self.assertEqual(response.status_code, 202, response.text)
+        request_id = response.json()["request_id"]
+        self.assertEqual(agent_socket.receive_json()["type"], "session.consent_request")
+        agent_socket.send_json({"type":"session.consent_response", "request_id":request_id, "accepted":accepted})
+        self.assertEqual(agent_socket.receive_json()["approved"], accepted)
+        return self.client.get(f"/api/v1/admin/computers/{computer_id}/screen/access-request/{request_id}", headers=self.dashboard_headers).json()
+
+    @contextmanager
+    def _consented_view(self, agent_socket, computer_id):
+        approved = self._approve_over_channel(agent_socket, computer_id)
+        with self.client.websocket_connect(f"ws://127.0.0.1/ws/admin/computers/{computer_id}/screen?ticket={approved['ticket']}") as viewer:
+            viewer.send_json({"type":"screen.start"})
+            self.assertEqual(agent_socket.receive_json()["type"], "screen.start")
+            agent_socket.send_json({"type":"screen.start_ack","accepted":True,"width":640,"height":360,
+                "screen_width":1920,"screen_height":1080,"max_fps":3})
+            self.assertTrue(viewer.receive_json()["accepted"])
+            yield viewer
+
+    def test_real_consent_flow_blocks_view_only_and_rejected_control(self):
+        agent_id, computer_id = self._register("authorized")
+        with self._agent_socket(agent_id) as agent:
+            agent.send_json({"type":"hello","agent_id":agent_id})
+            agent.receive_json()
+            with self._consented_view(agent, computer_id) as viewer:
+                viewer.send_json({"type":"control.start"})
+                self.assertEqual(viewer.receive_json(), {"type":"control.start_ack","accepted":False,"reason":"not_authorized"})
+                self._approve_over_channel(agent, computer_id, "control", False)
+                viewer.send_json({"type":"control.start"})
+                self.assertFalse(viewer.receive_json()["accepted"])
+                self.assertEqual(self.app.state.screen_streams.get(agent_id).control_state, "idle")
+
+    def test_real_consent_flow_allows_control_then_cancellation_stops_viewer(self):
+        agent_id, computer_id = self._register("authorized")
+        with self._agent_socket(agent_id) as agent:
+            agent.send_json({"type":"hello","agent_id":agent_id})
+            agent.receive_json()
+            with self._consented_view(agent, computer_id) as viewer:
+                self._approve_over_channel(agent, computer_id, "control")
+                viewer.send_json({"type":"control.start"})
+                self.assertEqual(agent.receive_json(), {"type":"control.start"})
+                agent.send_json({"type":"control.start_ack","accepted":True,"screen_width":1920,"screen_height":1080})
+                self.assertTrue(viewer.receive_json()["accepted"])
+                view_id = self.app.state.screen_streams.get(agent_id).view_request_id
+                response = self.client.post(f"/api/v1/admin/computers/{computer_id}/screen/access-request/{view_id}/cancel", headers=self.dashboard_headers)
+                self.assertEqual(response.status_code, 200)
+                with self.assertRaises(WebSocketDisconnect):
+                    viewer.receive_json()
+                self.assertFalse(self.app.state.remote_consent.active(view_id, "view"))
+
+    def test_forged_ticket_without_consent_cannot_open_viewer(self):
+        agent_id, computer_id = self._register("authorized")
+        self.app.state.agent_connections.connect(agent_id, computer_id)
+        ticket, _ = self.app.state.screen_streams.issue_ticket(agent_id, computer_id)
+        with self.assertRaises(WebSocketDisconnect):
+            with self.client.websocket_connect(f"ws://127.0.0.1/ws/admin/computers/{computer_id}/screen?ticket={ticket}"):
+                pass
+
+    def test_technician_revocation_terminates_active_consented_view(self):
+        created = self.client.post("/api/v1/admin/technicians", headers=self.dashboard_headers,
+            json={"username":"tech","display_name":"Test technician","password":"test-password-only"})
+        self.assertEqual(created.status_code, 200)
+        technician_id = created.json()["id"]
+        token = self.client.post("/api/v1/auth/login",json={"username":"tech","password":"test-password-only"}).json()["token"]
+        admin_headers = self.dashboard_headers
+        self.dashboard_headers = {"Authorization":f"Bearer {token}"}
+        agent_id, computer_id = self._register("authorized")
+        with self._agent_socket(agent_id) as agent:
+            agent.send_json({"type":"hello","agent_id":agent_id})
+            agent.receive_json()
+            with self._consented_view(agent, computer_id) as viewer:
+                view_id = self.app.state.screen_streams.get(agent_id).view_request_id
+                self.assertEqual(self.client.get(f"/api/v1/admin/computers/{computer_id}/screen/access-request/{view_id}",headers=admin_headers).status_code,404)
+                response = self.client.post(f"/api/v1/admin/technicians/{technician_id}/revoke",headers=admin_headers)
+                self.assertEqual(response.status_code,200)
+                self.assertEqual(agent.receive_json()["type"],"session.remote_stop")
+                with self.assertRaises(WebSocketDisconnect):
+                    viewer.receive_json()
+                self.assertFalse(self.app.state.remote_consent.active(view_id,"view"))
 
     def test_pending_or_disconnected_machine_cannot_request_remote_access(self):
         _, pending_id = self._register()
@@ -146,6 +282,7 @@ class ScreenApiTests(unittest.TestCase):
             self.assertEqual(command["type"], "session.consent_request")
             self.assertEqual(command["request_id"], request_id)
             self.assertEqual(command["technician_name"], "Técnico da TI")
+            self.assertEqual(command["mode"], "view")
 
             pending = self.client.get(
                 f"/api/v1/admin/computers/{computer_id}/screen/access-request/{request_id}",
@@ -170,6 +307,43 @@ class ScreenApiTests(unittest.TestCase):
             consumed_agent = self.app.state.screen_streams.consume_ticket(ticket, computer_id)
             self.assertEqual(consumed_agent, agent_id)
 
+    def test_control_requires_a_second_user_consent_and_does_not_issue_viewer_ticket(self):
+        agent_id, computer_id = self._register("authorized")
+        with self._agent_socket(agent_id) as agent_socket:
+            agent_socket.send_json({"type": "hello", "agent_id": agent_id, "version": "test"})
+            self.assertEqual(agent_socket.receive_json()["type"], "hello_ack")
+            ticket = self._issue_ticket(computer_id).json()["ticket"]
+            view_consent = self.app.state.remote_consent.for_ticket(ticket, computer_id)
+            self.app.state.remote_consent.claim(view_consent.request_id, "view")
+            viewer = self.app.state.screen_streams.attach(agent_id, computer_id)
+            viewer.view_request_id = view_consent.request_id
+            viewer.principal = "dashboard-admin"
+            viewer.state = "streaming"
+            response = self.client.post(
+                f"/api/v1/admin/computers/{computer_id}/screen/access-request?mode=control",
+                headers=self.dashboard_headers,
+            )
+            self.assertEqual(response.status_code, 202)
+            request_id = response.json()["request_id"]
+            command = agent_socket.receive_json()
+            self.assertEqual(command["type"], "session.consent_request")
+            self.assertEqual(command["mode"], "control")
+            agent_socket.send_json({"type": "session.consent_response", "request_id": request_id, "accepted": True})
+            result = agent_socket.receive_json()
+            self.assertTrue(result["approved"])
+            approved = self.client.get(
+                f"/api/v1/admin/computers/{computer_id}/screen/access-request/{request_id}",
+                headers=self.dashboard_headers,
+            )
+            self.assertEqual(approved.status_code, 200)
+            self.assertEqual(approved.json()["mode"], "control")
+            self.assertNotIn("ticket", approved.json())
+
+        connection = self.app.state.agent_connections.get(agent_id)
+        self.assertIsNotNone(connection)
+        self.assertFalse(connection.connected)
+        self.assertTrue(self.app.state.screen_streams.get(agent_id).disconnected.is_set())
+
     def test_user_rejection_does_not_issue_viewer_ticket(self):
         agent_id, computer_id = self._register("authorized")
         with self._agent_socket(agent_id) as agent_socket:
@@ -187,6 +361,11 @@ class ScreenApiTests(unittest.TestCase):
             )
             self.assertEqual(status.json()["status"], "rejected")
             self.assertNotIn("ticket", status.json())
+
+        connection = self.app.state.agent_connections.get(agent_id)
+        self.assertIsNotNone(connection)
+        self.assertFalse(connection.connected)
+        self.assertIsNone(self.app.state.screen_streams.get(agent_id))
 
     def test_pending_machine_cannot_open_control_viewer_with_stale_ticket(self):
         agent_id, computer_id = self._register()
@@ -342,6 +521,7 @@ class ScreenApiTests(unittest.TestCase):
                 )
                 self.assertTrue(viewer_socket.receive_json()["accepted"])
 
+                self._approve_control(agent_id, computer_id)
                 viewer_socket.send_json({"type": "control.start"})
                 self.assertEqual(agent_socket.receive_json(), {"type": "control.start"})
                 agent_socket.send_json(
@@ -402,6 +582,7 @@ class ScreenApiTests(unittest.TestCase):
                     }
                 )
                 self.assertTrue(viewer_socket.receive_json()["accepted"])
+                self._approve_control(agent_id, computer_id)
                 viewer_socket.send_json({"type": "control.start"})
                 self.assertEqual(agent_socket.receive_json(), {"type": "control.start"})
                 agent_socket.send_json(

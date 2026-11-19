@@ -7,6 +7,31 @@ from server.config import DEFAULT_DATABASE_URL, PROJECT_ROOT, Settings, load_set
 
 
 class ServerDatabaseConfigurationTests(unittest.TestCase):
+    def test_database_initialization_failure_disposes_engine_and_preserves_error(self):
+        from unittest.mock import MagicMock
+        from server.database.session import create_database
+        engine = MagicMock()
+        failure = RuntimeError("simulated schema failure")
+        with patch("server.database.session.create_engine",return_value=engine), \
+             patch("server.database.session.event.listens_for",return_value=lambda fn:fn), \
+             patch("server.database.session.Base.metadata.create_all",side_effect=failure):
+            with self.assertRaisesRegex(RuntimeError,"simulated schema failure"):
+                create_database("sqlite:///:memory:")
+        engine.dispose.assert_called_once()
+
+    def test_legacy_expiry_column_uses_postgresql_timestamp_type_without_connecting(self):
+        from sqlalchemy.dialects.postgresql import dialect
+        from unittest.mock import MagicMock
+        from server.database.session import _migrate_agent_credential_expiry
+        engine = MagicMock()
+        engine.dialect = dialect()
+        connection = engine.begin.return_value.__enter__.return_value
+        with patch("server.database.session.inspect") as inspect:
+            inspect.return_value.get_table_names.return_value = ["computers"]
+            inspect.return_value.get_columns.return_value = [{"name":"id"}]
+            _migrate_agent_credential_expiry(engine)
+        self.assertIn("TIMESTAMP WITH TIME ZONE", str(connection.execute.call_args.args[0]))
+
     def test_default_database_is_in_project_root(self):
         with patch.dict(os.environ, {}, clear=True):
             settings = load_settings()
@@ -45,6 +70,12 @@ class ServerDatabaseConfigurationTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "positive integers"):
             Settings(database_url="sqlite://", agent_token="a", dashboard_token="d", auth_failures_per_window=0)
+
+    def test_security_defaults_enable_hsts_and_credential_expiry(self):
+        with patch.dict(os.environ, {}, clear=True):
+            settings = load_settings()
+        self.assertTrue(settings.hsts_enabled)
+        self.assertEqual(settings.agent_credential_ttl_days, 90)
 
     def test_global_agent_credential_fallback_is_disabled_by_default(self):
         with patch.dict(os.environ, {}, clear=True):

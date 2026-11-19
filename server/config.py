@@ -1,6 +1,7 @@
 """Server settings loaded from environment variables."""
 
 import os
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -13,6 +14,7 @@ class Settings:
     database_url: str
     agent_token: str
     dashboard_token: str
+    enrollment_token: str = ""
     allow_legacy_agent_token: bool = False
     online_threshold_seconds: int = 900
     agent_heartbeat_interval_seconds: float = 30
@@ -32,8 +34,23 @@ class Settings:
     dashboard_operator_name: str = "Técnico da TI"
     remote_consent_ttl_seconds: int = 60
     remote_consent_requests_per_window: int = 10
+    agent_credential_ttl_days: int = 90
+    hsts_enabled: bool = True
+    auto_migrate: bool = True
+    database_pool_size: int = 3
+    database_max_overflow: int = 2
+    database_pool_timeout: float = 5
+    audit_log: str = ""
+    max_screen_viewers: int = 8
+    max_request_bytes: int = 1_048_576
+    sqlite_journal_mode: str = ''
+    
 
     def __post_init__(self) -> None:
+        if self.sqlite_journal_mode not in {'','DELETE','PERSIST'}:
+            raise ValueError('Unsupported SQLite journal mode')
+        if any(token.startswith("REPLACE_") for token in (self.agent_token,self.dashboard_token,self.enrollment_token)):
+            raise ValueError("Substitua os segredos de exemplo antes de iniciar o serviço")
         limits = (
             self.rate_limit_window_seconds,
             self.auth_failures_per_window,
@@ -43,9 +60,18 @@ class Settings:
             self.websocket_connections_per_window,
             self.remote_consent_ttl_seconds,
             self.remote_consent_requests_per_window,
+            self.agent_credential_ttl_days,
+            self.database_pool_size,
+            self.max_screen_viewers,
+            self.max_request_bytes,
         )
         if any(value < 1 for value in limits):
             raise ValueError("Rate limits and windows must be positive integers")
+        if self.database_max_overflow < 0 or not math.isfinite(self.database_pool_timeout) or self.database_pool_timeout <= 0:
+            raise ValueError("Database pool limits must be bounded and positive")
+        for value in (self.agent_heartbeat_interval_seconds,self.agent_heartbeat_timeout_seconds,self.agent_hello_timeout_seconds):
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError("Heartbeat and handshake deadlines must be finite and positive")
 
 
 def load_settings() -> Settings:
@@ -53,6 +79,7 @@ def load_settings() -> Settings:
         database_url=os.getenv("PREFEITURA_DATABASE_URL", DEFAULT_DATABASE_URL),
         agent_token=os.getenv("PREFEITURA_AGENT_TOKEN", ""),
         dashboard_token=os.getenv("PREFEITURA_DASHBOARD_TOKEN", ""),
+        enrollment_token=os.getenv("PREFEITURA_ENROLLMENT_TOKEN", ""),
         allow_legacy_agent_token=os.getenv(
             "PREFEITURA_ALLOW_LEGACY_AGENT_TOKEN", "false"
         ).strip().lower() in {"1", "true", "yes", "on"},
@@ -84,4 +111,14 @@ def load_settings() -> Settings:
         dashboard_operator_name=os.getenv("PREFEITURA_DASHBOARD_OPERATOR_NAME", "Técnico da TI").strip() or "Técnico da TI",
         remote_consent_ttl_seconds=int(os.getenv("PREFEITURA_REMOTE_CONSENT_TTL", "60")),
         remote_consent_requests_per_window=int(os.getenv("PREFEITURA_REMOTE_CONSENT_LIMIT", "10")),
+        agent_credential_ttl_days=int(os.getenv("PREFEITURA_AGENT_CREDENTIAL_TTL_DAYS", "90")),
+        hsts_enabled=os.getenv("PREFEITURA_HSTS_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"},
+        auto_migrate=os.getenv("PREFEITURA_AUTO_MIGRATE", "true").strip().lower() in {"1","true","yes","on"},
+        database_pool_size=int(os.getenv("PREFEITURA_DATABASE_POOL_SIZE", "3")),
+        database_max_overflow=int(os.getenv("PREFEITURA_DATABASE_MAX_OVERFLOW", "2")),
+        database_pool_timeout=float(os.getenv("PREFEITURA_DATABASE_POOL_TIMEOUT", "5")),
+        audit_log=os.getenv("PREFEITURA_AUDIT_LOG", ""),
+        max_screen_viewers=int(os.getenv("PREFEITURA_MAX_SCREEN_VIEWERS", "8")),
+        max_request_bytes=int(os.getenv("PREFEITURA_MAX_REQUEST_BYTES", "1048576")),
+        sqlite_journal_mode=os.getenv('PREFEITURA_SQLITE_JOURNAL_MODE','').strip().upper(),
     )

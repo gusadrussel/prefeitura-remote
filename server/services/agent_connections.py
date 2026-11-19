@@ -1,7 +1,9 @@
 """In-process registry for currently connected, authenticated agents."""
 
 import uuid
-from asyncio import Queue, QueueEmpty, QueueFull
+from asyncio import QueueFull
+from threading import RLock
+from server.services.async_bridge import Mailbox, synchronized
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -18,13 +20,15 @@ class AgentConnection:
     connected: bool
     connected_at: datetime
     last_heartbeat: datetime
-    outbound: Queue[dict]
+    outbound: Mailbox
 
 
 class AgentConnectionRegistry:
     def __init__(self) -> None:
+        self._lock = RLock()
         self._connections: dict[str, AgentConnection] = {}
 
+    @synchronized
     def connect(self, agent_id: str, computer_id: int) -> AgentConnection:
         timestamp = utc_now()
         connection = AgentConnection(
@@ -34,11 +38,12 @@ class AgentConnectionRegistry:
             connected=True,
             connected_at=timestamp,
             last_heartbeat=timestamp,
-            outbound=Queue(maxsize=8),
+            outbound=Mailbox(maxsize=8),
         )
         self._connections[agent_id] = connection
         return connection
 
+    @synchronized
     def heartbeat(self, agent_id: str, connection_id: str) -> AgentConnection | None:
         connection = self._connections.get(agent_id)
         if connection is None or not connection.connected or connection.connection_id != connection_id:
@@ -46,16 +51,20 @@ class AgentConnectionRegistry:
         connection.last_heartbeat = utc_now()
         return connection
 
+    @synchronized
     def disconnect(self, agent_id: str, connection_id: str) -> AgentConnection | None:
         connection = self._connections.get(agent_id)
         if connection is None or connection.connection_id != connection_id:
             return None
         connection.connected = False
+        connection.outbound.clear()
         return connection
 
+    @synchronized
     def get(self, agent_id: str) -> AgentConnection | None:
         return self._connections.get(agent_id)
 
+    @synchronized
     def send(self, agent_id: str, message: dict) -> bool:
         connection = self._connections.get(agent_id)
         if connection is None or not connection.connected:
@@ -66,14 +75,10 @@ class AgentConnectionRegistry:
             return False
         return True
 
+    @synchronized
     def send_urgent(self, agent_id: str, message: dict) -> bool:
         connection = self._connections.get(agent_id)
         if connection is None or not connection.connected:
             return False
-        while True:
-            try:
-                connection.outbound.get_nowait()
-            except QueueEmpty:
-                break
-        connection.outbound.put_nowait(message)
+        connection.outbound.replace(message)
         return True

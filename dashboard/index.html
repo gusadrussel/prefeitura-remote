@@ -3,7 +3,9 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="light">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#103a2d">
+  <link rel="icon" type="image/svg+xml" href="/dashboard/assets/prefeitura-remote-icon.svg">
   <title>Inventário | Prefeitura Remote</title>
   <link rel="stylesheet" href="/dashboard/css/dashboard.css">
   <script src="/dashboard/js/dashboard.js" defer></script>
@@ -11,11 +13,12 @@
 <body>
   <header class="topbar">
     <a class="brand" href="/" aria-label="Prefeitura Remote, início">
-      <span class="brand-mark" aria-hidden="true">PR</span>
+      <span class="brand-mark" aria-hidden="true"><img src="/dashboard/assets/prefeitura-remote-icon.svg" alt=""></span>
       <span class="brand-name">Prefeitura <b>Remote</b></span>
     </a>
     <div class="topbar-right">
       <span class="service-indicator"><span class="indicator-dot"></span> Central de inventário</span>
+      <button class="icon-button" id="theme-button" type="button" title="Alternar modo escuro" aria-label="Alternar modo escuro">◐</button>
       <button class="icon-button hidden" id="logout-button" type="button" title="Encerrar acesso" aria-label="Encerrar acesso">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 17l5-5-5-5M15 12H3m9-8h7a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-7"/></svg>
       </button>
@@ -30,10 +33,15 @@
         <p>Acesse com a credencial de técnico.</p>
       </div>
       <form id="login-form">
-        <label for="token-input">Token do painel</label>
-        <div class="input-with-button">
-          <input id="token-input" name="token" type="password" autocomplete="current-password" required>
-          <button class="primary-button" type="submit">Acessar</button>
+        <div class="login-fields">
+          <label for="username-input">Usuário do técnico</label>
+          <input id="username-input" name="username" type="text" autocomplete="username" placeholder="Seu usuário">
+          <label for="password-input">Senha</label>
+          <input id="password-input" name="password" type="password" autocomplete="current-password" placeholder="Sua senha">
+          <div class="login-divider"><span>ou</span></div>
+          <label for="token-input">Credencial administrativa</label>
+          <input id="token-input" name="token" type="password" autocomplete="off" placeholder="Use somente para administração inicial">
+          <button class="primary-button full-width" type="submit">Entrar</button>
         </div>
         <p class="form-error" id="login-error" role="alert"></p>
       </form>
@@ -59,6 +67,18 @@
         <span class="updated-at" id="updated-at"></span>
       </div>
 
+      <section class="tool-card installation-codes hidden" id="installation-codes" aria-labelledby="installation-codes-title">
+        <h2 id="installation-codes-title">Códigos de instalação</h2>
+        <button id="issue-installation-code" type="button">Gerar código de uso único</button>
+        <p id="installation-code-error" role="status"></p>
+        <dialog id="installation-code-dialog" aria-labelledby="installation-code-dialog-title">
+          <h2 id="installation-code-dialog-title">Código de instalação</h2>
+          <p>Entregue este código ao usuário por um canal privado. Ele vale por 30 minutos e aparece somente nesta janela.</p>
+          <label>Código <input id="issued-installation-code" type="text" readonly autocomplete="off" size="46"></label>
+          <form method="dialog"><button type="submit">Fechar</button></form>
+        </dialog>
+      </section>
+
       <div class="content-grid">
         <section class="computer-list" aria-label="Lista de computadores">
           <div class="list-toolbar">
@@ -83,7 +103,7 @@
           <div class="table-scroll">
             <table>
               <thead><tr><th scope="col">COMPUTADOR</th><th scope="col">USUÁRIO</th><th scope="col">SISTEMA</th><th scope="col">AUTORIZAÇÃO</th><th scope="col">AGENTE</th><th scope="col">CANAL WS</th><th scope="col">VISTO POR ÚLTIMO</th></tr></thead>
-              <tbody id="computer-rows"><tr><td class="empty-state" colspan="7">Aguardando acesso ao painel.</td></tr></tbody>
+              <tbody id="computer-rows"><tr><td class="empty-state" colspan="7">Faça login para carregar os computadores.</td></tr></tbody>
             </table>
           </div>
         </section>
@@ -96,6 +116,11 @@
           </div>
         </aside>
       </div>
+
+      <section class="admin-tools" id="admin-tools" aria-label="Ferramentas administrativas">
+        <div class="tool-card"><h2>Técnicos</h2><button id="new-tech-button" type="button">Criar conta</button><div id="technician-list"></div></div>
+        <div class="tool-card"><h2>Chamados</h2><button id="new-ticket-button" type="button">Novo chamado</button><div id="ticket-list"></div></div>
+      </section>
       <p class="global-error" id="global-error" role="status"></p>
     </section>
   </main>
