@@ -1,4 +1,4 @@
-# Prefeitura Remote
+# Vyntra
 
 Plataforma interna para inventário autorizado de computadores e visualização/controle assistido de tela. O agente coleta dados locais e os envia à API central; o painel permite visualizar e, mediante início explícito, controlar mouse e teclado. O projeto não executa comandos arbitrários, transfere arquivos, eleva privilégios ou contorna proteções do Windows.
 
@@ -45,6 +45,10 @@ export PREFEITURA_DATABASE_URL="postgresql+psycopg://usuario:senha@localhost:543
 O SQLAlchemy cria a tabela inicial automaticamente. Em produção, use migrações antes de alterar o esquema.
 
 ## Agente
+
+O instalador Windows `Vyntra-Setup.exe` cria o atalho **Vyntra** no menu Iniciar. No assistente de instalação, marque **Iniciar o Vyntra automaticamente ao entrar no Windows** se quiser habilitar essa opção. O cliente mostra o ID do computador, a conexão com o servidor e as solicitações de acesso. O botão **Encerrar sessão** fica disponível na janela e na bandeja durante o acesso remoto.
+
+Em um ambiente Windows de desenvolvimento com PyInstaller e Inno Setup, gere os binários com `python -B -m tools.build_windows --execute --output artifacts/vyntra-build`. O relatório e os logs ficam no diretório de saída junto aos executáveis.
 
 O agente pode ser executado no Linux ou Windows. Sem URL do servidor, imprime uma coleta JSON e termina:
 

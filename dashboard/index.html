@@ -1,23 +1,23 @@
 <!doctype html>
-<html lang="pt-BR">
+<html lang="pt-BR" data-theme="dark">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
-  <meta name="theme-color" content="#103a2d">
-  <link rel="icon" type="image/svg+xml" href="/dashboard/assets/prefeitura-remote-icon.svg">
-  <title>Inventário | Prefeitura Remote</title>
+  <meta name="theme-color" content="#0B1120">
+  <link rel="icon" type="image/svg+xml" href="/dashboard/assets/vyntra.svg">
+  <title>Vyntra Console</title>
   <link rel="stylesheet" href="/dashboard/css/dashboard.css">
   <script src="/dashboard/js/dashboard.js" defer></script>
 </head>
 <body>
   <header class="topbar">
-    <a class="brand" href="/" aria-label="Prefeitura Remote, início">
-      <span class="brand-mark" aria-hidden="true"><img src="/dashboard/assets/prefeitura-remote-icon.svg" alt=""></span>
-      <span class="brand-name">Prefeitura <b>Remote</b></span>
+    <a class="brand" href="/" aria-label="Vyntra Console, início">
+      <span class="brand-mark" aria-hidden="true"><img src="/dashboard/assets/vyntra.svg" alt=""></span>
+      <span class="brand-name"><b>Vyntra</b> Console</span>
     </a>
     <div class="topbar-right">
-      <span class="service-indicator"><span class="indicator-dot"></span> Central de inventário</span>
+      <span class="service-indicator"><span class="indicator-dot" id="server-dot"></span> <span id="server-state" role="status">Consultando servidor…</span></span>
       <button class="icon-button" id="theme-button" type="button" title="Alternar modo escuro" aria-label="Alternar modo escuro">◐</button>
       <button class="icon-button hidden" id="logout-button" type="button" title="Encerrar acesso" aria-label="Encerrar acesso">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 17l5-5-5-5M15 12H3m9-8h7a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-7"/></svg>
@@ -28,7 +28,6 @@
   <main class="workspace">
     <section class="login-panel" id="login-panel" aria-labelledby="login-title">
       <div class="login-heading">
-        <span class="eyebrow">ACESSO RESTRITO</span>
         <h1 id="login-title">Entrar no painel</h1>
         <p>Acesse com a credencial de técnico.</p>
       </div>
@@ -47,11 +46,20 @@
       </form>
     </section>
 
-    <section class="app-view hidden" id="app-view" aria-label="Inventário de computadores">
+    <section class="app-view hidden" id="app-view" aria-label="Vyntra Console">
+      <nav class="sidebar" aria-label="Navegação do Console">
+        <button type="button" class="nav-link" data-view="overview"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 3h7v7H3zM14 3h7v7h-7zM3 14h7v7H3zM14 14h7v7h-7z"/></svg>Visão geral</button>
+        <button type="button" class="nav-link" data-view="computers"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 4h18v13H3zM8 21h8M12 17v4"/></svg>Computadores</button>
+        <button type="button" class="nav-link" data-view="pending"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 7v5l3 2M22 12a10 10 0 1 1-20 0 10 10 0 0 1 20 0Z"/></svg>Solicitações pendentes</button>
+        <button type="button" class="nav-link" data-view="codes"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 3a6 6 0 0 0-5 9L3 19v2h4v-3h3v-3l2-2a6 6 0 1 0 3-10ZM16 8h.01"/></svg>Códigos de instalação</button>
+        <button type="button" class="nav-link" data-view="sessions"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5h18v14H3zM6 12h3l2-4 3 8 2-4h2"/></svg>Sessões remotas</button>
+        <button type="button" class="nav-link" data-view="settings"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16M8 3v6M16 9v6M10 15v6"/></svg>Configurações</button>
+        <span class="console-version">Vyntra Console 1.5.0</span>
+      </nav>
       <div class="page-heading">
         <div>
-          <span class="eyebrow">SUPORTE DE TI · ATIVOS</span>
-          <h1>Computadores</h1>
+          <h1 id="view-title">Visão geral</h1>
+          <p class="view-description" id="view-description">Acompanhe os computadores cadastrados.</p>
         </div>
         <button class="refresh-button" id="refresh-button" type="button" title="Atualizar lista">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5M6.1 9a7 7 0 0 1 11.5-2L20 12M4 12l2.4 5a7 7 0 0 0 11.5-2"/></svg>
@@ -59,17 +67,26 @@
         </button>
       </div>
 
-      <div class="summary-strip" aria-label="Resumo de dispositivos">
-        <div class="summary-item"><span class="summary-label">DISPOSITIVOS</span><strong id="total-count">--</strong></div>
-        <div class="summary-item"><span class="summary-label">ONLINE</span><strong class="online-text" id="online-count">--</strong></div>
-        <div class="summary-item"><span class="summary-label">OFFLINE</span><strong class="offline-text" id="offline-count">--</strong></div>
-        <div class="summary-item"><span class="summary-label">CANAIS WS</span><strong class="online-text" id="channel-count">--</strong></div>
-        <span class="updated-at" id="updated-at"></span>
+      <section id="overview-view" data-panel aria-label="Resumo de dispositivos">
+      <div class="summary-strip">
+        <div class="summary-item"><span class="summary-label">Computadores</span><strong id="total-count">--</strong></div>
+        <div class="summary-item"><span class="summary-label">Online</span><strong class="online-text" id="online-count">--</strong></div>
+        <div class="summary-item"><span class="summary-label">Offline</span><strong class="offline-text" id="offline-count">--</strong></div>
+        <div class="summary-item"><span class="summary-label">Aguardando aprovação</span><strong class="online-text" id="pending-count">--</strong></div>
+        <div class="summary-item"><span class="summary-label">Sessões remotas ativas</span><strong id="session-count">--</strong><span class="summary-note" id="session-count-note"></span></div>
       </div>
+      <section class="tool-card recent-card" aria-labelledby="recent-title">
+        <h2 id="recent-title">Contatos recentes</h2>
+        <ul class="recent-devices" id="recent-devices"><li>Carregando inventário…</li></ul>
+      </section>
+      </section>
 
+      <section id="codes-view" class="hidden" data-panel>
+      <p class="tool-card" id="code-availability" role="status">Verificando permissão para emitir códigos…</p>
       <section class="tool-card installation-codes hidden" id="installation-codes" aria-labelledby="installation-codes-title">
         <h2 id="installation-codes-title">Códigos de instalação</h2>
-        <button id="issue-installation-code" type="button">Gerar código de uso único</button>
+        <p>Cadastre um computador com um código de uso único válido por 30 minutos.</p>
+        <button class="primary-button" id="issue-installation-code" type="button">Gerar código de uso único</button>
         <p id="installation-code-error" role="status"></p>
         <dialog id="installation-code-dialog" aria-labelledby="installation-code-dialog-title">
           <h2 id="installation-code-dialog-title">Código de instalação</h2>
@@ -79,22 +96,30 @@
         </dialog>
       </section>
 
-      <div class="content-grid">
+      </section>
+
+      <div class="content-grid hidden" id="computers-view" data-panel>
         <section class="computer-list" aria-label="Lista de computadores">
           <div class="list-toolbar">
             <div class="list-filters">
               <label class="search-field" for="search-input">
                 <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.8" cy="10.8" r="6.8"/><path d="m16 16 4.5 4.5"/></svg>
-                <input id="search-input" type="search" placeholder="Buscar por hostname" autocomplete="off">
+                <input id="search-input" type="search" placeholder="Nome ou ID do dispositivo" aria-label="Buscar computadores" autocomplete="off">
                 <kbd>/</kbd>
               </label>
               <label class="authorization-filter" for="authorization-filter">
                 <span>Autorização</span>
                 <select id="authorization-filter">
                   <option value="">Todos os estados</option>
-                  <option value="pending">Pending</option>
-                  <option value="authorized">Authorized</option>
-                  <option value="revoked">Revoked</option>
+                  <option value="pending">Pendentes</option>
+                  <option value="authorized">Autorizados</option>
+                  <option value="revoked">Revogados</option>
+                </select>
+              </label>
+              <label class="authorization-filter">
+                <span>Conexão</span>
+                <select id="connection-filter">
+                  <option value="">Todas</option><option value="online">Online</option><option value="offline">Offline</option>
                 </select>
               </label>
             </div>
@@ -102,7 +127,7 @@
           </div>
           <div class="table-scroll">
             <table>
-              <thead><tr><th scope="col">COMPUTADOR</th><th scope="col">USUÁRIO</th><th scope="col">SISTEMA</th><th scope="col">AUTORIZAÇÃO</th><th scope="col">AGENTE</th><th scope="col">CANAL WS</th><th scope="col">VISTO POR ÚLTIMO</th></tr></thead>
+              <thead><tr><th scope="col">COMPUTADOR</th><th scope="col">ID DO DISPOSITIVO</th><th scope="col">SISTEMA</th><th scope="col">AUTORIZAÇÃO</th><th scope="col">CONEXÃO</th><th scope="col">ÚLTIMA CONEXÃO</th><th scope="col">AÇÕES</th></tr></thead>
               <tbody id="computer-rows"><tr><td class="empty-state" colspan="7">Faça login para carregar os computadores.</td></tr></tbody>
             </table>
           </div>
@@ -117,13 +142,28 @@
         </aside>
       </div>
 
-      <section class="admin-tools" id="admin-tools" aria-label="Ferramentas administrativas">
-        <div class="tool-card"><h2>Técnicos</h2><button id="new-tech-button" type="button">Criar conta</button><div id="technician-list"></div></div>
+      <section id="sessions-view" class="hidden" data-panel>
+        <section class="tool-card">
+        <h2>Sessões ativas no servidor</h2>
+        <p id="remote-sessions-status" role="status">Consultando sessões…</p>
+        <ul id="remote-session-list" class="session-list"></ul>
+        </section>
+        <section class="tool-card">
+        <h2>Sessão neste Console</h2>
+        <p id="console-session" role="status">Nenhuma sessão iniciada nesta aba.</p>
+        <button id="return-to-session" type="button" class="hidden">Voltar à sessão</button>
+        </section>
+      </section>
+      <section id="settings-view" class="hidden" data-panel>
+      <p id="settings-status" class="tool-card hidden" role="status"></p>
+      <section class="admin-tools hidden" id="admin-tools" aria-label="Ferramentas administrativas">
+        <div class="tool-card"><h2>Técnicos</h2><button id="new-tech-button" class="hidden" type="button">Criar conta</button><div id="technician-list"></div></div>
         <div class="tool-card"><h2>Chamados</h2><button id="new-ticket-button" type="button">Novo chamado</button><div id="ticket-list"></div></div>
       </section>
+      </section>
+      <p class="updated-at" id="updated-at"></p>
       <p class="global-error" id="global-error" role="status"></p>
     </section>
   </main>
-  <footer class="footer"><span>Prefeitura Remote</span><span>Inventário de ativos</span></footer>
 </body>
 </html>

@@ -22,7 +22,13 @@
   const locale = "pt-BR";
   let computers = [];
   let selectedId = null;
-  let searchTimer = null;
+  let currentView = "overview";
+  let computerLoad = 0;
+  let detailLoad = 0;
+  let sessionsLoad = 0;
+  let activeSessions = [];
+  const connectionFilter = document.querySelector("#connection-filter");
+  const codeAvailability = document.querySelector("#code-availability");
   let screenSocket = null;
   let screenComputerId = null;
   let screenState = "idle";
@@ -71,13 +77,135 @@
     themeButton.textContent = theme === "dark" ? "☀" : "◐";
     themeButton.title = theme === "dark" ? "Usar modo claro" : "Usar modo escuro";
     themeButton.setAttribute("aria-label", themeButton.title);
-    localStorage.setItem("prefeitura-theme", theme);
+    localStorage.setItem("vyntra-theme", theme);
   }
-  applyTheme(localStorage.getItem("prefeitura-theme") || "light");
+  applyTheme(localStorage.getItem("vyntra-theme") || "dark");
   themeButton.addEventListener("click", () => applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark"));
+
+  const views = {
+    overview: "Acompanhe os computadores cadastrados.",
+    computers: "Consulte os dispositivos e solicite suporte remoto.",
+    pending: "Revise os computadores que aguardam aprovação.",
+    codes: "Autorize o cadastro de novos dispositivos.",
+    sessions: "Acompanhe a visualização e o controle remoto desta aba.",
+    settings: "",
+  };
+
+  function selectView(view) {
+    currentView = view;
+    const listView = view === "computers" || view === "pending";
+    document.querySelectorAll("[data-panel]").forEach((panel) => {
+      panel.classList.toggle("hidden", panel.id !== (listView ? "computers-view" : view + "-view"));
+    });
+    document.querySelectorAll("[data-view]").forEach((button) => {
+      if (button.dataset.view === view) {
+        button.setAttribute("aria-current", "page");
+        document.querySelector("#view-title").textContent = button.textContent.trim();
+      } else {
+        button.removeAttribute("aria-current");
+      }
+    });
+    document.querySelector("#view-description").textContent = views[view];
+    authorizationFilter.closest("label").classList.toggle("hidden", view === "pending");
+    releaseHeldInputs();
+    if (listView) renderComputers();
+    if (view === "sessions") {
+      updateConsoleSession();
+      loadRemoteSessions();
+    }
+    if (view === "settings") loadAdminTools();
+  }
+
+  document.querySelectorAll("[data-view]").forEach((button) => {
+    button.addEventListener("click", () => selectView(button.dataset.view));
+  });
+  document.querySelector("#return-to-session").addEventListener("click", () => selectView("computers"));
+
+  async function checkServer() {
+    const state = document.querySelector("#server-state");
+    const dot = document.querySelector("#server-dot");
+    try {
+      const response = await fetch("/api/v1/health", { cache: "no-store", signal: AbortSignal.timeout(5000) });
+      if (!response.ok || (await response.json()).status !== "ok") throw new Error();
+      state.textContent = "Servidor operacional";
+      dot.dataset.state = "online";
+    } catch {
+      state.textContent = "Servidor indisponível";
+      dot.dataset.state = "offline";
+    }
+  }
+
+  function updateConsoleSession() {
+    const computer = computers.find((item) => item.id === screenComputerId);
+    const hasSession = screenComputerId !== null && !["idle", "stopped"].includes(screenState);
+    document.querySelector("#console-session").textContent = hasSession
+      ? `${computer?.display_name || computer?.hostname || "Computador remoto"} · ${screenStateLabel()} · ${controlStateLabel()}`
+      : "Nenhuma sessão iniciada nesta aba.";
+    document.querySelector("#return-to-session").classList.toggle("hidden", !hasSession);
+  }
+
+  function renderRemoteSessions() {
+    const names = new Map(computers.map((computer) => [computer.id, computer.display_name || computer.hostname]));
+    document.querySelector("#remote-session-list").innerHTML = activeSessions.map((session) => `
+      <li><strong>${escapeHtml(names.get(session.computer_id) || `Computador #${session.computer_id}`)}</strong>
+      <span>${session.mode === "control" ? "Controle remoto" : "Visualização"}</span></li>`).join("");
+  }
+
+  async function loadRemoteSessions() {
+    const load = ++sessionsLoad;
+    const status = document.querySelector("#remote-sessions-status");
+    const count = document.querySelector("#session-count");
+    const note = document.querySelector("#session-count-note");
+    try {
+      const response = await fetch("/api/v1/admin/remote-sessions", { headers: authHeaders(), cache: "no-store" });
+      const sessions = response.ok ? await response.json() : [];
+      if (load !== sessionsLoad || !token()) return;
+      if (response.status === 401) {
+        sessionStorage.removeItem("dashboard_token");
+        showLogin("Token inválido ou expirado.");
+        return;
+      }
+      if (!response.ok) {
+        status.textContent = response.status === 403 ? "A lista do servidor exige acesso administrativo."
+          : "O servidor está sem dados de sessões.";
+        count.textContent = "—";
+        note.textContent = response.status === 403 ? "Acesso administrativo" : "Indisponível";
+      } else {
+        status.textContent = sessions.length ? "" : "Nenhuma sessão remota ativa.";
+        count.textContent = sessions.length;
+        note.textContent = "";
+      }
+      activeSessions = sessions;
+      renderRemoteSessions();
+    } catch {
+      if (load !== sessionsLoad || !token()) return;
+      activeSessions = [];
+      status.textContent = "Não foi possível consultar as sessões.";
+      count.textContent = "—";
+      note.textContent = "Indisponível";
+      renderRemoteSessions();
+    }
+  }
 
   function showLogin(message = "") {
     installationSession += 1;
+    computerLoad += 1;
+    detailLoad += 1;
+    sessionsLoad += 1;
+    activeSessions = [];
+    renderRemoteSessions();
+    document.querySelector("#session-count-note").textContent = "";
+    document.querySelector("#remote-sessions-status").textContent = "Consultando sessões…";
+    computers = [];
+    selectedId = null;
+    rows.replaceChildren();
+    document.querySelector("#admin-tools").classList.add("hidden");
+    document.querySelector("#new-tech-button").classList.add("hidden");
+    document.querySelector("#updated-at").textContent = "";
+    document.querySelector("#global-error").textContent = "";
+    document.querySelector("#recent-devices").innerHTML = "<li>Carregando inventário…</li>";
+    document.querySelectorAll(".summary-item strong").forEach((metric) => { metric.textContent = "—"; });
+    showPlaceholder("Selecione um computador", "Consulte informações e ações do dispositivo.");
     installationCodes.classList.add("hidden");
     issuedCode.value = "";
     codeError.textContent = "";
@@ -96,18 +224,31 @@
     loginPanel.classList.add("hidden");
     appView.classList.remove("hidden");
     logoutButton.classList.remove("hidden");
+    selectView("overview");
     loadComputers();
-    loadAdminTools();
     loadInstallationCodes();
+    loadRemoteSessions();
   }
 
   async function loadInstallationCodes() {
     const session = installationSession;
+    installationCodes.classList.add("hidden");
+    document.querySelector("#new-tech-button").classList.add("hidden");
+    codeAvailability.classList.remove("hidden");
+    codeAvailability.textContent = "Verificando permissão para emitir códigos…";
     try {
       const response = await fetch("/api/v1/admin/installation-codes", { headers: authHeaders(), cache: "no-store" });
-      if (response.ok && session === installationSession) installationCodes.classList.remove("hidden");
+      if (session !== installationSession) return;
+      if (response.ok) {
+        installationCodes.classList.remove("hidden");
+        document.querySelector("#new-tech-button").classList.remove("hidden");
+        codeAvailability.classList.add("hidden");
+      } else {
+        codeAvailability.textContent = response.status === 403 ? "A emissão de códigos exige acesso administrativo."
+          : "A emissão de códigos está indisponível.";
+      }
     } catch {
-      if (session === installationSession) installationCodes.classList.add("hidden");
+      if (session === installationSession) codeAvailability.textContent = "Não foi possível verificar a disponibilidade.";
     }
   }
 
@@ -140,9 +281,9 @@
       ...options,
       headers: { ...authHeaders(), ...(options.headers || {}) },
     });
-    if (response.status === 401 || response.status === 503) {
+    if (response.status === 401) {
       sessionStorage.removeItem("dashboard_token");
-      showLogin(response.status === 401 ? "Token inválido ou expirado." : "Autenticação não configurada no servidor.");
+      showLogin("Token inválido ou expirado.");
       throw new Error("Acesso não autorizado.");
     }
     if (!response.ok) {
@@ -157,62 +298,93 @@
         502: "O servidor está temporariamente indisponível.",
         503: "O serviço está temporariamente indisponível.",
       };
-      throw new Error(messages[response.status] || detail.detail || "Não foi possível concluir a operação.");
+      const supportDetails = [
+        "Agente não conectado ao canal",
+        "Não foi possível solicitar confirmação no computador",
+        "Visualização consentida ativa obrigatória",
+        "Auditoria indisponível",
+      ];
+      throw new Error(supportDetails.includes(detail.detail) ? detail.detail :
+        messages[response.status] || "Não foi possível concluir a operação.");
     }
     return response.json();
   }
 
   async function loadComputers() {
+    const load = ++computerLoad;
     globalError.textContent = "";
-    if (!computers.length) rows.innerHTML = '<tr><td class="empty-state" colspan="7">Carregando computadores…</td></tr>';
     try {
-      const search = new URLSearchParams();
-      if (searchInput.value.trim()) search.set("search", searchInput.value.trim());
-      if (authorizationFilter.value) search.set("authorization_status", authorizationFilter.value);
-      computers = await api(`/api/v1/admin/computers?${search}`);
+      const loaded = new Map();
+      const pageSize = 500;
+      for (let offset = 0; ; offset += pageSize) {
+        const page = await api(`/api/v1/admin/computers?limit=${pageSize}&offset=${offset}`);
+        if (load !== computerLoad) return;
+        const before = loaded.size;
+        page.forEach((computer) => loaded.set(computer.id, computer));
+        if (page.length < pageSize) break;
+        if (before === loaded.size) throw new Error("O servidor não oferece paginação para este inventário.");
+      }
+      computers = [...loaded.values()];
       renderComputers();
+      renderRecentDevices();
+      renderRemoteSessions();
+      if (selectedId !== null && screenComputerId === null) loadDetail(selectedId);
       document.querySelector("#updated-at").textContent = `Atualizado ${formatTime(new Date().toISOString())}`;
     } catch (error) {
-      if (token()) globalError.textContent = error.message;
+      if (token() && load === computerLoad) globalError.textContent = error.message;
     }
+  }
+
+  function renderRecentDevices() {
+    const recent = computers.filter((computer) => computer.last_seen)
+      .sort((a, b) => new Date(b.last_seen) - new Date(a.last_seen)).slice(0, 5);
+    const list = document.querySelector("#recent-devices");
+    list.innerHTML = recent.map((computer) => `
+      <li><button type="button" data-id="${computer.id}">
+        <span>${escapeHtml(computer.display_name || computer.hostname)}</span>
+        <time datetime="${escapeHtml(computer.last_seen)}">${escapeHtml(formatTime(computer.last_seen))}</time>
+      </button></li>`).join("") || "<li>Nenhum dispositivo enviou inventário ainda.</li>";
+    list.querySelectorAll("button").forEach((button) => {
+      button.addEventListener("click", () => {
+        selectView("computers");
+        loadDetail(Number(button.dataset.id), { focus: true });
+      });
+    });
   }
 
   function renderComputers() {
     const online = computers.filter((computer) => computer.online).length;
-    const connectedChannels = computers.filter((computer) => computer.channel_connected).length;
     document.querySelector("#total-count").textContent = computers.length;
     document.querySelector("#online-count").textContent = online;
     document.querySelector("#offline-count").textContent = computers.length - online;
-    document.querySelector("#channel-count").textContent = connectedChannels;
-    document.querySelector("#result-count").textContent = `${computers.length} resultado${computers.length === 1 ? "" : "s"}`;
-    if (selectedId !== null && !computers.some((computer) => computer.id === selectedId)) {
-      if (screenComputerId !== null) closeScreenViewer();
-      selectedId = null;
-    }
-    if (!computers.length) {
-      rows.innerHTML = `<tr><td class="empty-state" colspan="7">${searchInput.value.trim() || authorizationFilter.value ? "Nenhum computador corresponde aos filtros." : "Nenhum computador cadastrado."}</td></tr>`;
-      showPlaceholder("Nenhum equipamento encontrado", "Ajuste a busca ou aguarde o próximo inventário.");
+    document.querySelector("#pending-count").textContent = computers.filter((computer) => computer.authorization_status === "pending").length;
+    const query = searchInput.value.trim().toLocaleLowerCase(locale);
+    const authorization = currentView === "pending" ? "pending" : authorizationFilter.value;
+    const connection = connectionFilter.value;
+    const visible = computers.filter((computer) =>
+      (!authorization || computer.authorization_status === authorization)
+      && (!connection || computer.online === (connection === "online"))
+      && [computer.hostname, computer.display_name, computer.agent_id].some((value) => value?.toLocaleLowerCase(locale).includes(query))
+    );
+    document.querySelector("#result-count").textContent = `${visible.length} resultado${visible.length === 1 ? "" : "s"}`;
+    if (!visible.length) {
+      const empty = currentView === "pending" && !query && !connection ? "Nenhuma solicitação pendente."
+        : query || authorization || connection ? "Nenhum computador corresponde aos filtros." : "Nenhum computador cadastrado.";
+      rows.innerHTML = `<tr><td class="empty-state" colspan="7">${empty}</td></tr>`;
       return;
     }
-    rows.innerHTML = computers.map((computer) => `
-      <tr data-id="${computer.id}" class="${selectedId === computer.id ? "selected" : ""}" tabindex="0" aria-label="Detalhes de ${escapeHtml(computer.hostname)}">
-        <td><span class="hostname">${escapeHtml(computer.display_name || computer.hostname)}</span><span class="cell-subtle">${escapeHtml(computer.agent_id.slice(0, 8))}</span></td>
-        <td>${escapeHtml(computer.logged_user || "Não informado")}</td>
-        <td>${escapeHtml(computer.os_name || "Não informado")}<span class="cell-subtle">${escapeHtml(computer.agent_version ? `Agente ${computer.agent_version}` : "")}</span></td>
+    rows.innerHTML = visible.map((computer) => `
+      <tr data-id="${computer.id}" class="${selectedId === computer.id ? "selected" : ""}">
+        <td><span class="hostname">${escapeHtml(computer.display_name || computer.hostname)}</span></td>
+        <td><code>${escapeHtml(computer.agent_id)}</code></td>
+        <td>${escapeHtml(computer.os_name || "Não informado")}</td>
         <td><span class="status ${escapeHtml(computer.authorization_status)}">${escapeHtml(authorizationLabel(computer.authorization_status))}</span></td>
         <td><span class="status ${computer.online ? "online" : "offline"}">${computer.online ? "Online" : "Offline"}</span></td>
-        <td><span class="status ${computer.channel_connected ? "channel-active" : "channel-inactive"}">${computer.channel_connected ? "Conectado" : "Desconectado"}</span></td>
         <td>${escapeHtml(formatTime(computer.last_seen))}</td>
+        <td><button type="button" class="table-action" aria-label="Detalhes de ${escapeHtml(computer.hostname)}">Detalhes</button></td>
       </tr>`).join("");
-    loadAdminTools();
-    rows.querySelectorAll("tr[data-id]").forEach((row) => {
-      const select = () => loadDetail(Number(row.dataset.id));
-      row.addEventListener("click", select);
-      row.addEventListener("keydown", (event) => {
-        if (event.key === "Enter" || event.key === " ") { event.preventDefault(); select(); }
-      });
-    });
-    if (selectedId !== null && computers.some((computer) => computer.id === selectedId)) loadDetail(selectedId);
+    rows.querySelectorAll("tr[data-id]").forEach((row) =>
+      row.addEventListener("click", () => loadDetail(Number(row.dataset.id), { focus: true })));
   }
 
   function showPlaceholder(title, description) {
@@ -220,7 +392,7 @@
   }
 
   function authorizationLabel(status) {
-    return ({ pending: "Pendente de aprovação", authorized: "Autorizado", revoked: "Revogado" })[status] || "Pending";
+    return ({ pending: "Pendente de aprovação", authorized: "Autorizado", revoked: "Revogado" })[status] || "Não informado";
   }
 
   async function changeAuthorization(id, action) {
@@ -241,14 +413,25 @@
     return `<section class="detail-section"><h3>${escapeHtml(title)}</h3>${content}</section>`;
   }
 
-  async function loadDetail(id) {
+  async function loadDetail(id, { focus = false } = {}) {
+    if (selectedId === id && screenComputerId === id) {
+      if (focus) detailPanel.scrollIntoView({ block: "start" });
+      return;
+    }
     if (screenComputerId !== null && screenComputerId !== id) closeScreenViewer();
+    const load = ++detailLoad;
     selectedId = id;
     detailPanel.innerHTML = '<div class="detail-placeholder"><span class="detail-symbol" aria-hidden="true">…</span><h2>Carregando equipamento</h2><p>Buscando os dados mais recentes.</p></div>';
     rows.querySelectorAll("tr[data-id]").forEach((row) => row.classList.toggle("selected", Number(row.dataset.id) === id));
     try {
       const result = await api(`/api/v1/admin/computers/${id}`);
-      renderDetail(result.computer, result.inventory);
+      if (load === detailLoad) {
+        renderDetail(result.computer, result.inventory || {});
+        if (focus && !detailPanel.closest(".hidden")) {
+          detailPanel.querySelector("h2")?.focus({ preventScroll: true });
+          detailPanel.scrollIntoView({ block: "start" });
+        }
+      }
     } catch (error) {
       if (token()) globalError.textContent = error.message;
     }
@@ -287,7 +470,7 @@
     const gpus = (inventory.gpus || []).map((gpu) => `<div class="hardware-item"><strong>${escapeHtml(gpu.name)}</strong><span>${escapeHtml(gpu.driver_version || "")}</span></div>`).join("");
 
     detailPanel.innerHTML = `
-      <header class="detail-header"><div class="detail-header-top"><div><span class="eyebrow">EQUIPAMENTO</span><h2>${escapeHtml(computer.hostname)}</h2><div class="detail-meta">${escapeHtml(computer.agent_id)}</div></div>
+      <header class="detail-header"><div class="detail-header-top"><div><h2 tabindex="-1">${escapeHtml(computer.display_name || computer.hostname)}</h2><div class="detail-meta">${escapeHtml(computer.agent_id)}</div></div>
       <div class="detail-statuses"><span class="status ${escapeHtml(computer.authorization_status)}">${escapeHtml(authorizationLabel(computer.authorization_status))}</span><span class="status ${computer.online ? "online" : "offline"}">${computer.online ? "Online" : "Offline"}</span><span class="status ${computer.channel_connected ? "channel-active" : "channel-inactive"}">${computer.channel_connected ? "Canal conectado" : "Canal desconectado"}</span></div></div>
       <div class="detail-actions">${authorizationAction}<button type="button" data-rename-computer>Editar nome</button></div></header>
       ${section("SISTEMA", detailRow("Usuário", computer.logged_user) + detailRow("Sistema", computer.os_name) + detailRow("Versão", computer.os_version) + detailRow("Arquitetura", system.architecture) + detailRow("Uptime", system.uptime_seconds ? `${Math.floor(system.uptime_seconds / 86400)} dias` : null) + detailRow("Último contato", formatTime(computer.last_seen)) + detailRow("Canal persistente", computer.channel_connected ? "Conectado" : "Desconectado") + detailRow("Conectado em", formatTime(computer.channel_connected_at)) + detailRow("Último heartbeat", formatTime(computer.channel_last_heartbeat)))}
@@ -314,7 +497,7 @@
       try {
         const messages = await api(`/api/v1/admin/computers/${computer.id}/messages`);
         const box = detailPanel.querySelector('[data-chat-messages]');
-        if (!box) return;
+        if (!box || selectedId !== computer.id) return;
         const ordered = messages.slice(-40);
         const newestId = ordered.length ? Number(ordered[ordered.length - 1].id) : 0;
         const hadNewClientMessage = newestId > chatLastMessageId && ordered.some((m) => Number(m.id) > chatLastMessageId && m.sender === 'client');
@@ -330,19 +513,26 @@
           box.classList.add('chat-updated');
         }
         box.scrollTop = box.scrollHeight;
-      } catch (e) {
-        // Keep the chat visible if a transient polling request fails.
+      } catch (error) {
+        if (selectedId === computer.id) globalError.textContent = error.message;
       }
     }
-    detailPanel.querySelector('[data-chat-send]')?.addEventListener('click', async () => {
+    detailPanel.querySelector('[data-chat-send]')?.addEventListener('click', async (event) => {
       const input = detailPanel.querySelector('[data-chat-input]');
       const message = input?.value.trim();
       if (!message) return;
+      const button = event.currentTarget;
+      button.disabled = true;
       try {
-        await api(`/api/v1/admin/computers/${computer.id}/messages?message=${encodeURIComponent(message)}`, {method:'POST'});
+        const result = await api(`/api/v1/admin/computers/${computer.id}/messages`, {
+          method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({message}),
+        });
         input.value = '';
+        if (selectedId === computer.id) globalError.textContent = result.delivered
+          ? '' : 'Mensagem salva no histórico. O canal do cliente estava indisponível.';
         await loadChat();
       } catch(e) { globalError.textContent = e.message; }
+      finally { button.disabled = false; }
     });
     chatLastMessageId = 0;
     if (chatPollTimer !== null) clearInterval(chatPollTimer);
@@ -350,9 +540,8 @@
     chatPollTimer = setInterval(() => {
       if (selectedId === computer.id && document.visibilityState !== 'hidden') loadChat();
     }, 1200);
-    loadChat();
     detailPanel.querySelector("[data-rename-computer]")?.addEventListener("click", async () => {
-      const name = prompt("Nome exibido no Prefeitura Remote:", computer.display_name || computer.hostname);
+      const name = prompt("Nome exibido no Vyntra:", computer.display_name || computer.hostname);
       if (!name) return;
       try { await api(`/api/v1/admin/computers/${computer.id}/name?name=${encodeURIComponent(name)}`, {method:"PATCH"}); await loadComputers(); } catch (error) { globalError.textContent = error.message; }
     });
@@ -514,6 +703,7 @@
   }
 
   function updateControlControls() {
+    updateConsoleSession();
     const status = detailPanel.querySelector("[data-control-status]");
     if (status) {
       status.textContent = controlStateLabel();
@@ -853,17 +1043,29 @@
     clearHeldInputState();
     screenFrameData = null;
     screenLastFrameAt = null;
+    updateConsoleSession();
     if (socket && socket.readyState < WebSocket.CLOSING) socket.close(1000, "viewer mudou de máquina");
   }
 
   async function loadAdminTools() {
     const techBox=document.querySelector('#technician-list'), ticketBox=document.querySelector('#ticket-list');
+    const settingsStatus = document.querySelector("#settings-status");
+    const session = installationSession;
+    const adminTools = document.querySelector("#admin-tools");
     if(!techBox||!ticketBox)return;
     try {
       const [techs,tickets]=await Promise.all([api('/api/v1/admin/technicians'),api('/api/v1/admin/tickets')]);
+      if (session !== installationSession) return;
+      adminTools.classList.remove("hidden");
+      settingsStatus.classList.add("hidden");
       techBox.innerHTML=techs.map(t=>`<div class="tool-item"><strong>${escapeHtml(t.display_name)}</strong> · ${escapeHtml(t.username)} ${t.authorized?'':'(revogado)'}</div>`).join('')||'<p>Nenhum técnico cadastrado.</p>';
       ticketBox.innerHTML=tickets.slice(0,12).map(t=>`<div class="tool-item"><strong>#${t.id} ${escapeHtml(t.title)}</strong><br>${escapeHtml(t.status)} · ${escapeHtml(t.priority)}</div>`).join('')||'<p>Nenhum chamado.</p>';
-    } catch(e) {}
+    } catch (error) {
+      if (session !== installationSession) return;
+      adminTools.classList.add("hidden");
+      settingsStatus.textContent = error.message;
+      settingsStatus.classList.remove("hidden");
+    }
   }
   function requestTechnicianAccount() {
     return new Promise((resolve) => {
@@ -939,26 +1141,25 @@
     showLogin();
     await fetch('/api/v1/auth/logout', { method: 'POST', headers: logoutHeaders }).catch(() => {});
   });
-  searchInput.addEventListener("input", () => {
-    clearTimeout(searchTimer);
-    searchTimer = setTimeout(loadComputers, 180);
-  });
-  authorizationFilter.addEventListener("change", loadComputers);
+  searchInput.addEventListener("input", renderComputers);
+  authorizationFilter.addEventListener("change", renderComputers);
+  connectionFilter.addEventListener("change", renderComputers);
   document.querySelector("#refresh-button").addEventListener("click", async () => {
     const button = document.querySelector("#refresh-button");
     if (!button || button.disabled) return;
     button.disabled = true;
     button.classList.add("is-refreshing");
     try {
-      await Promise.all([loadComputers(), loadAdminTools()]);
-      document.querySelector("#updated-at").textContent = `Atualizado ${formatTime(new Date().toISOString())}`;
+      await Promise.all([loadComputers(), checkServer(), loadRemoteSessions(),
+        currentView === "settings" && loadAdminTools(),
+        currentView === "codes" && loadInstallationCodes()]);
     } finally {
       button.disabled = false;
       button.classList.remove("is-refreshing");
     }
   });
   document.addEventListener("keydown", (event) => {
-    if (!event.defaultPrevented && event.key === "/"
+    if (["computers", "pending"].includes(currentView) && token() && !event.defaultPrevented && event.key === "/"
       && !["INPUT", "TEXTAREA"].includes(document.activeElement.tagName)) {
       event.preventDefault();
       searchInput.focus();
@@ -972,5 +1173,11 @@
   });
   window.addEventListener("blur", releaseHeldInputs);
 
+  checkServer();
+  setInterval(() => {
+    if (document.visibilityState === "hidden") return;
+    checkServer();
+    if (token() && ["overview", "sessions"].includes(currentView)) loadRemoteSessions();
+  }, 15000);
   if (token()) showApp(); else showLogin();
 })();

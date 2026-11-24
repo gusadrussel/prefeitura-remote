@@ -7,6 +7,30 @@ from agent.remote_input import RemoteInputController, valid_control_input
 
 
 class RemoteInputControllerTests(unittest.TestCase):
+    def test_revocation_discards_inputs_already_queued_before_execution(self):
+        entered, release = Event(), Event()
+        authorized = Event()
+        authorized.set()
+        backend = Mock()
+        def key_down(key):
+            entered.set()
+            release.wait(2)
+        backend.keyDown.side_effect = key_down
+        controller = RemoteInputController(backend=backend)
+        controller.set_authorization_check(authorized.is_set)
+        controller.start(100, 100)
+        try:
+            controller.apply({"type":"control.input","action":"key.down","key":"a"})
+            self.assertTrue(entered.wait(1))
+            controller.apply({"type":"control.input","action":"key.down","key":"b"})
+            authorized.clear()
+            release.set()
+        finally:
+            release.set()
+            controller.stop()
+        backend.keyDown.assert_called_once_with("a")
+        backend.keyUp.assert_called_once_with("a")
+
     def test_control_input_requires_allowlisted_shape_and_values(self):
         valid = {"type": "control.input", "action": "key.down", "key": "a"}
         self.assertTrue(valid_control_input(valid))

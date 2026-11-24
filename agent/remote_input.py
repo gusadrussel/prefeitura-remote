@@ -82,6 +82,10 @@ class RemoteInputController:
         self._worker: Thread | None = None
         self._keys_down: set[str] = set()
         self._buttons_down: set[str] = set()
+        self._authorization_check = lambda: True
+
+    def set_authorization_check(self, check) -> None:
+        self._authorization_check = check
 
     def start(self, width: int, height: int) -> None:
         if (
@@ -103,7 +107,7 @@ class RemoteInputController:
         self._worker.start()
 
     def apply(self, message: dict) -> None:
-        if not self._active or self._worker_failed or not valid_control_input(message):
+        if not self._active or self._worker_failed or not self._authorization_check() or not valid_control_input(message):
             raise ValueError("Mensagem de controle inválida ou sessão inativa")
         try:
             self._queue.put_nowait(dict(message))
@@ -123,7 +127,7 @@ class RemoteInputController:
         try:
             while True:
                 message = self._queue.get()
-                if message is _STOP_WORKER:
+                if message is _STOP_WORKER or not self._active or not self._authorization_check():
                     break
                 self._apply_now(message)
         except Exception as exc:

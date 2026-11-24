@@ -43,7 +43,7 @@ def create_app(settings: Settings | None = None, database_url: str | None = None
                 app.state.engine.dispose()
             close_audit(audit_handler)
 
-    app = FastAPI(title="Prefeitura Remote Inventory", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="Vyntra Console", version="1.5.0", lifespan=lifespan)
     app.state.settings = settings or load_settings()
     effective_database_url = database_url or app.state.settings.database_url
     def initialize_persistence():

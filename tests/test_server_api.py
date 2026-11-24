@@ -144,10 +144,32 @@ class InventoryApiTests(unittest.TestCase):
         self.assertEqual(self.client.get("/api/v1/health").json(), {"status": "ok"})
         page = self.client.get("/")
         self.assertEqual(page.status_code, 200)
-        self.assertIn("Prefeitura", page.text)
+        self.assertIn("<title>Vyntra Console</title>", page.text)
+        self.assertEqual(self.client.get("/dashboard/assets/vyntra.svg").status_code, 200)
         stylesheet = self.client.get("/dashboard/css/dashboard.css")
         self.assertEqual(stylesheet.status_code, 200)
         self.assertIn("--forest", stylesheet.text)
+
+    def test_active_remote_sessions_require_admin_and_follow_acknowledgements(self):
+        path = "/api/v1/admin/remote-sessions"
+        headers = {"Authorization": "Bearer dashboard-test-token"}
+        self.assertEqual(self.client.get(path).status_code, 401)
+        account = {"username": "operator", "display_name": "Operator", "password": "test-password-only"}
+        self.assertEqual(self.client.post("/api/v1/admin/technicians", json=account, headers=headers).status_code, 200)
+        login = self.client.post("/api/v1/auth/login", json={"username": account["username"], "password": account["password"]})
+        self.assertEqual(login.status_code, 200)
+        self.assertEqual(self.client.get(path, headers={"Authorization": "Bearer " + login.json()["token"]}).status_code, 403)
+
+        streams = self.app.state.screen_streams
+        viewer = streams.attach("test-agent", 42)
+        self.assertTrue(streams.request_start(viewer))
+        self.assertEqual(self.client.get(path, headers=headers).json(), [])
+        streams.agent_started("test-agent", {"type": "screen.start_ack", "accepted": True})
+        response = self.client.get(path, headers=headers)
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+        self.assertEqual(response.json(), [{"computer_id": 42, "mode": "view"}])
+        streams.agent_disconnected("test-agent")
+        self.assertEqual(self.client.get(path, headers=headers).json(), [])
 
     def test_inventory_requires_agent_token_and_can_be_searched(self):
         inventory = {

@@ -19,6 +19,33 @@ from server.routes.websocket import (
 
 
 class AgentWebSocketClientTests(unittest.TestCase):
+    def test_chat_round_trip_keeps_websocket_open_for_consent(self):
+        stop = threading.Event()
+        client = MagicMock()
+        client.end_session = threading.Event()
+        client.next_chat.side_effect = ["Resposta do cliente", None, None, None]
+        fake = MagicMock()
+        fake.__enter__.return_value = fake
+        request = {"type": "session.consent_request", "request_id": "request-1",
+                   "technician_name": "TI", "mode": "view", "hostname": "TEST", "expires_in": 30}
+        fake.recv.side_effect = list(map(json.dumps, [
+            hello_ack_message("agent-1", datetime.now(UTC), 30),
+            {"type": "chat.message", "message_id": 1, "sender": "technician", "message": "Mensagem da TI"},
+            request, {"type": "disconnect_ack"},
+        ]))
+        with patch("agent.connection.connect", return_value=fake), patch("agent.connection.ConsentController") as controller:
+            consent = controller.return_value
+            consent.poll.return_value = None
+            consent.request.side_effect = lambda *args: stop.set() or True
+            run_websocket_session("https://central.example.gov", "agent-1", "test", 300,
+                                  lambda: None, stop_event=stop, client_app=client)
+        client.receive_chat.assert_called_once_with("Mensagem da TI")
+        consent.request.assert_called_once_with("request-1", "TI", "view", "TEST", 30)
+        sent = [json.loads(call.args[0]) for call in fake.send.call_args_list]
+        self.assertIn({"type": "chat.message", "message_id": 0, "sender": "client",
+                       "message": "Resposta do cliente"}, sent)
+        self.assertEqual(sent[-1]["type"], "disconnect")
+
     def test_channel_credential_is_agent_specific_and_matches_server(self):
         first = derive_channel_credential("agent-1", "shared-agent-secret")
         second = derive_channel_credential("agent-2", "shared-agent-secret")

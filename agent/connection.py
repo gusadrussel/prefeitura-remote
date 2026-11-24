@@ -11,22 +11,29 @@ from collections.abc import Callable
 from threading import Event
 from urllib.parse import quote, urlsplit, urlunsplit
 
-from websockets.exceptions import WebSocketException
+from websockets.exceptions import InvalidStatus, WebSocketException
 from websockets.sync.client import connect
 
+from agent import __version__
 from agent.remote_input import RemoteInputController, valid_control_input
 from agent.consent import ConsentController
 from agent.screen_capture import ScreenCapture
+from agent.client_app import ClientApp
 
 HEARTBEAT_ACK_TIMEOUT_SECONDS = 30
 CLOSE_ACK_TIMEOUT_SECONDS = 2
 RECONNECT_DELAY_SECONDS = 5
 CHANNEL_CREDENTIAL_CONTEXT = b"prefeitura-remote:agent-channel:v1:"
 LOGGER = logging.getLogger("prefeitura_remote.agent.control")
+DIAGNOSTICS = logging.getLogger("prefeitura_remote.diagnostics")
 
 
 def validate_server_url(server_url: str) -> str:
+    if not isinstance(server_url,str) or len(server_url)>2048 or any(ord(c)<32 or ord(c)==127 for c in server_url):
+        raise ValueError('URL do servidor inválida')
     parsed = urlsplit(server_url)
+    if parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment:
+        raise ValueError('URL do servidor não pode conter credenciais, query ou fragmento')
     if parsed.scheme == "https" and parsed.hostname:
         return server_url.rstrip("/")
     if parsed.scheme == "http" and parsed.hostname:
@@ -121,9 +128,12 @@ def _valid_agent_command(message: dict) -> bool:
         )
     if message_type == "session.consent_request":
         return (
-            set(message) == {"type", "request_id", "technician_name", "hostname", "expires_in"}
+            set(message) == {
+                "type", "request_id", "technician_name", "mode", "hostname", "expires_in"
+            }
             and isinstance(message["request_id"], str)
             and isinstance(message["technician_name"], str)
+            and message["mode"] in {"view", "control"}
             and isinstance(message["hostname"], str)
             and isinstance(message["expires_in"], int)
             and not isinstance(message["expires_in"], bool)
@@ -138,6 +148,10 @@ def _valid_agent_command(message: dict) -> bool:
         )
     if message_type == "session.remote_stop":
         return set(message) == {"type", "reason"} and isinstance(message["reason"], str)
+    if message_type == "chat.message":
+        return (set(message) == {"type", "message_id", "sender", "message"}
+                and isinstance(message["message_id"], int) and isinstance(message["sender"], str)
+                and isinstance(message["message"], str) and 1 <= len(message["message"]) <= 2000)
     return False
 
 
@@ -151,6 +165,7 @@ def run_websocket_session(
     screen_capture_factory: Callable[..., ScreenCapture] | None = None,
     remote_input_factory: Callable[[], RemoteInputController] | None = None,
     individual_credential: bool = False,
+    client_app: ClientApp | None = None,
 ) -> None:
     if not token:
         raise ValueError("Configure PREFEITURA_AGENT_TOKEN para autenticar o canal")
@@ -158,6 +173,7 @@ def run_websocket_session(
     capture = None
     remote_input = None
     consent = ConsentController()
+    control_consent = ConsentController()
     screen_size: tuple[int, int] | None = None
     try:
         with connect(
@@ -171,12 +187,12 @@ def run_websocket_session(
             close_timeout=5,
             max_size=64 * 1024,
         ) as connection:
-            _send_json(
-                connection,
-                {"type": "hello", "agent_id": agent_id, "version": "0.1.0"},
-            )
+            _send_json(connection, {"type": "hello", "agent_id": agent_id, "version": __version__})
             hello_ack = _receive_json(connection, timeout=10)
             validate_hello_ack(hello_ack, agent_id)
+            DIAGNOSTICS.info("Canal autenticado")
+            if client_app is not None:
+                client_app.status("Conectado ao canal de suporte")
 
             heartbeat_interval = max(1.0, float(hello_ack.get("heartbeat_interval", 30)))
             last_inventory_at = time.monotonic()
@@ -185,12 +201,37 @@ def run_websocket_session(
             pending_frame: tuple[bytes, int, int] | None = None
             frame_sequence = 0
             frame_rate = 1
+            last_sharing = (False, False)
+            last_pending = False
+            if client_app is not None:
+                client_app.end_session.clear()
 
             while True:
                 if stop_event is not None and stop_event.is_set():
                     break
+                if client_app is not None and client_app.end_session.is_set():
+                    client_app.end_session.clear()
+                    consent.request_stop()
+                consent_event = consent.poll()
+                if consent_event is None:
+                    consent_event = control_consent.poll()
+                stopping_locally = consent_event is not None and consent_event.kind == "user_stop"
+                if capture is not None and not consent.is_active("view") and not stopping_locally:
+                    if remote_input is not None:
+                        remote_input.stop()
+                        remote_input = None
+                    _close_capture(capture)
+                    capture = None
+                    screen_size = pending_frame = next_frame_at = None
+                    control_consent.stop()
+                    _send_json(connection, {"type":"screen.stop_ack", "stopped":True, "reason":"session_inactive"})
+                if remote_input is not None and not control_consent.is_active("control") and not stopping_locally:
+                    remote_input.stop()
+                    remote_input = None
+                    _send_json(connection, {"type":"control.stop_ack", "stopped":True, "reason":"session_inactive"})
 
                 if remote_input is not None and getattr(remote_input, "failed", False):
+                    control_consent.stop()
                     failure_reason = getattr(remote_input, "failure_reason", None) or "backend_error"
                     remote_input.stop()
                     remote_input = None
@@ -204,7 +245,6 @@ def run_websocket_session(
                         },
                     )
 
-                consent_event = consent.poll()
                 if consent_event is not None:
                     if consent_event.kind in {"accept", "reject"} and consent_event.request_id:
                         _send_json(
@@ -216,6 +256,16 @@ def run_websocket_session(
                             },
                         )
                     elif consent_event.kind == "user_stop" and consent_event.request_id:
+                        # Stop locally before attempting any network notification.
+                        consent.stop()
+                        control_consent.stop()
+                        if remote_input is not None:
+                            remote_input.stop()
+                            remote_input = None
+                        if capture is not None:
+                            _close_capture(capture)
+                            capture = None
+                        screen_size = pending_frame = next_frame_at = None
                         _send_json(
                             connection,
                             {
@@ -223,6 +273,12 @@ def run_websocket_session(
                                 "request_id": consent_event.request_id,
                             },
                         )
+
+                if client_app is not None:
+                    outgoing_chat = client_app.next_chat()
+                    if outgoing_chat is not None:
+                        _send_json(connection, {"type": "chat.message", "message_id": 0,
+                                                "sender": "client", "message": outgoing_chat})
 
                 now = time.monotonic()
                 if capture is not None and next_frame_at is not None and now >= next_frame_at:
@@ -246,6 +302,8 @@ def run_websocket_session(
                         frame_sequence += 1
                         next_frame_at = time.monotonic() + 1 / frame_rate
                     except Exception:
+                        consent.stop()
+                        control_consent.stop()
                         if remote_input is not None:
                             LOGGER.error("remote_control_stopped reason=capture_failed")
                             remote_input.stop()
@@ -260,6 +318,7 @@ def run_websocket_session(
                             )
                         _close_capture(capture)
                         capture = None
+                        screen_size = None
                         pending_frame = None
                         next_frame_at = None
                         _send_json(
@@ -275,6 +334,18 @@ def run_websocket_session(
                 if now >= next_heartbeat_at:
                     _send_json(connection, {"type": "heartbeat"})
                     next_heartbeat_at = now + heartbeat_interval
+
+                sharing = (capture is not None, remote_input is not None)
+                if client_app is not None and sharing != last_sharing:
+                    client_app.session_status("Controle remoto ativo" if sharing[1] else
+                                              "Visualização remota ativa" if sharing[0] else
+                                              "Compartilhamento inativo", active=sharing[0] or sharing[1])
+                last_sharing = sharing
+                if client_app is not None:
+                    pending = bool(consent.is_pending() or control_consent.is_pending())
+                    if pending != last_pending:
+                        client_app.request_status(pending)
+                    last_pending = pending
 
                 deadlines = [next_heartbeat_at]
                 if capture is not None and next_frame_at is not None:
@@ -297,10 +368,15 @@ def run_websocket_session(
                     if now - last_inventory_at >= inventory_interval_seconds:
                         inventory_callback()
                         last_inventory_at = now
+                elif message_type == "chat.message":
+                    if client_app is not None and message["sender"] == "technician":
+                        client_app.receive_chat(message["message"])
                 elif message_type == "session.consent_request":
-                    if not consent.request(
+                    controller = consent if message["mode"] == "view" else control_consent
+                    if (message["mode"] == "control" and not consent.is_active("view")) or not controller.request(
                         message["request_id"],
                         message["technician_name"],
+                        message["mode"],
                         message["hostname"],
                         message["expires_in"],
                     ):
@@ -314,11 +390,16 @@ def run_websocket_session(
                         )
                 elif message_type == "session.consent_result":
                     if message["approved"]:
-                        consent.activate(message["request_id"])
+                        if not consent.activate(message["request_id"]):
+                            control_consent.activate(message["request_id"])
                     else:
-                        consent.stop()
+                        if control_consent.matches(message["request_id"]):
+                            control_consent.stop()
+                        elif consent.matches(message["request_id"]):
+                            consent.stop()
                 elif message_type == "session.remote_stop":
                     consent.stop()
+                    control_consent.stop()
                     if remote_input is not None:
                         remote_input.stop()
                         remote_input = None
@@ -330,6 +411,9 @@ def run_websocket_session(
                     next_frame_at = None
                     _send_json(connection, {"type": "screen.stop_ack", "stopped": True})
                 elif message_type == "screen.start":
+                    if not consent.is_active("view"):
+                        _send_json(connection, {"type":"screen.start_ack", "accepted":False, "reason":"not_authorized"})
+                        continue
                     if capture is not None:
                         _send_json(
                             connection,
@@ -376,6 +460,8 @@ def run_websocket_session(
                             },
                         )
                     except Exception:
+                        consent.stop()
+                        control_consent.stop()
                         if candidate is not None:
                             _close_capture(candidate)
                         capture = None
@@ -387,6 +473,8 @@ def run_websocket_session(
                             {"type": "screen.start_ack", "accepted": False, "reason": "capture_unavailable"},
                         )
                 elif message_type == "screen.stop":
+                    consent.stop()
+                    control_consent.stop()
                     if remote_input is not None:
                         LOGGER.info("remote_control_stopped reason=screen_stopped")
                         remote_input.stop()
@@ -407,7 +495,9 @@ def run_websocket_session(
                         "remote_control_start_received capture_active=%s",
                         capture is not None and screen_size is not None,
                     )
-                    if remote_input is not None:
+                    if not consent.is_active("view") or not control_consent.is_active("control"):
+                        _send_json(connection, {"type":"control.start_ack", "accepted":False, "reason":"not_authorized"})
+                    elif remote_input is not None:
                         LOGGER.warning("remote_control_start_rejected reason=already_running")
                         _send_json(
                             connection,
@@ -424,6 +514,10 @@ def run_websocket_session(
                         try:
                             factory = remote_input_factory or RemoteInputController
                             candidate_input = factory()
+                            if hasattr(candidate_input, "set_authorization_check"):
+                                candidate_input.set_authorization_check(
+                                    lambda: consent.is_active("view") and control_consent.is_active("control")
+                                )
                             candidate_input.start(*screen_size)
                             remote_input = candidate_input
                             LOGGER.info(
@@ -443,6 +537,7 @@ def run_websocket_session(
                         except Exception as exc:
                             if candidate_input is not None:
                                 candidate_input.stop()
+                            control_consent.stop()
                             LOGGER.exception(
                                 "remote_control_start_rejected reason=input_unavailable exception=%s",
                                 type(exc).__name__,
@@ -452,13 +547,14 @@ def run_websocket_session(
                                 {"type": "control.start_ack", "accepted": False, "reason": "input_unavailable"},
                             )
                 elif message_type == "control.stop":
+                    control_consent.stop()
                     if remote_input is not None:
                         LOGGER.info("remote_control_stopped reason=operator_request")
                         remote_input.stop()
                         remote_input = None
                     _send_json(connection, {"type": "control.stop_ack", "stopped": True})
                 elif message_type == "control.input":
-                    if remote_input is None:
+                    if remote_input is None or not control_consent.is_active("control") or not consent.is_active("view"):
                         _send_json(
                             connection,
                             {"type": "control.stop_ack", "stopped": True, "reason": "session_inactive"},
@@ -479,6 +575,7 @@ def run_websocket_session(
                             )
                 elif message_type == "session.stop":
                     consent.stop()
+                    control_consent.stop()
                     if remote_input is not None:
                         LOGGER.info("remote_control_stopped reason=%s", message["reason"])
                         remote_input.stop()
@@ -501,15 +598,32 @@ def run_websocket_session(
             if capture is not None:
                 _close_capture(capture)
                 capture = None
+            consent.stop()
+            control_consent.stop()
+            if remote_input is not None:
+                remote_input.stop()
+                remote_input = None
             _send_json(connection, {"type": "disconnect"})
             try:
                 _receive_json(connection, timeout=CLOSE_ACK_TIMEOUT_SECONDS)
             except TimeoutError:
                 pass
+    except InvalidStatus as exc:
+        status = exc.response.status_code
+        DIAGNOSTICS.warning("Canal recusado na abertura status_http=%d", status)
+        raise RuntimeError(f"Canal recusado na abertura (HTTP {status})") from None
     except (OSError, TimeoutError, WebSocketException) as exc:
-        raise RuntimeError(f"Canal WebSocket indisponível: {exc}") from exc
+        DIAGNOSTICS.warning("Canal interrompido tipo=%s", type(exc).__name__)
+        raise RuntimeError("Canal WebSocket indisponível") from None
     finally:
+        consent.stop()
+        control_consent.stop()
         if remote_input is not None:
             remote_input.stop()
         if capture is not None:
             _close_capture(capture)
+        if client_app is not None:
+            client_app.request_status(False)
+            client_app.session_status("Compartilhamento inativo")
+            while client_app.next_chat() is not None:
+                pass

@@ -125,6 +125,14 @@ class ScreenStreamRegistry:
         return self._viewers.get(agent_id)
 
     @synchronized
+    def active_sessions(self) -> list[dict]:
+        return [
+            {"computer_id": viewer.computer_id, "mode": "control" if viewer.control_started else "view"}
+            for viewer in self._viewers.values()
+            if viewer.view_started and not viewer.disconnected.is_set()
+        ]
+
+    @synchronized
     def request_start(self, viewer: ScreenViewer) -> bool:
         if viewer.state != "idle" or viewer.disconnected.is_set():
             return False

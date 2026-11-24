@@ -1,0 +1,17 @@
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(1, 5, 0, 0), prodvers=(1, 5, 0, 0), mask=0x3F,
+    flags=0, OS=0x40004, fileType=1, subtype=0, date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo([StringTable('041604B0', [
+      StringStruct('FileDescription', 'Vyntra'),
+      StringStruct('FileVersion', '1.5.0'),
+      StringStruct('InternalName', 'Vyntra'),
+      StringStruct('OriginalFilename', 'Vyntra.exe'),
+      StringStruct('ProductName', 'Vyntra'),
+      StringStruct('ProductVersion', '1.5.0'),
+    ])]),
+    VarFileInfo([VarStruct('Translation', [1046, 1200])]),
+  ],
+)

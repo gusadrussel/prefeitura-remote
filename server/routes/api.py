@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Callable
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
+from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
@@ -320,12 +320,13 @@ def list_computers(
     search: str = Query(default="", max_length=255),
     authorization_status: AuthorizationStatus | None = Query(default=None),
     limit: int = Query(default=200, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     authorization: str | None = Header(default=None),
     session: Session = Depends(get_session),
 ):
     _technician(request, authorization)
     statement = select(request.app.state.computer_model).order_by(
-        request.app.state.computer_model.hostname
+        request.app.state.computer_model.hostname, request.app.state.computer_model.id
     )
     if search.strip():
         statement = statement.where(request.app.state.computer_model.hostname.ilike(f"%{search.strip()}%"))
@@ -333,7 +334,7 @@ def list_computers(
         statement = statement.where(
             request.app.state.computer_model.authorization_status == authorization_status
         )
-    computers = session.scalars(statement.limit(limit)).all()
+    computers = session.scalars(statement.offset(offset).limit(limit)).all()
     threshold = request.app.state.settings.online_threshold_seconds
     connections = request.app.state.agent_connections
     return [
@@ -651,6 +652,12 @@ def _require_admin(request: Request, authorization: str | None = Header(default=
     return technician
 
 
+@router.get("/api/v1/admin/remote-sessions")
+def active_remote_sessions(request: Request, _operator: Technician = Depends(_require_admin)):
+    return JSONResponse(request.app.state.screen_streams.active_sessions(),
+                        headers={"Cache-Control": "no-store"})
+
+
 @router.get("/api/v1/admin/installation-codes")
 def installation_code_policy(_operator: Technician = Depends(_require_admin)):
     return JSONResponse({"expires_in": ACTIVATION_CODE_TTL_SECONDS},
@@ -766,7 +773,7 @@ def list_messages(computer_id: int, request: Request, authorization: str | None 
     return [{"id": m.id, "sender": m.sender, "message": m.message, "created_at": m.created_at} for m in reversed(rows)]
 
 @router.post("/api/v1/admin/computers/{computer_id}/messages")
-def send_message(computer_id: int, request: Request, message: str, authorization: str | None = Header(default=None), session: Session = Depends(get_session)):
+def send_message(computer_id: int, request: Request, message: str = Body(embed=True), authorization: str | None = Header(default=None), session: Session = Depends(get_session)):
     tech = _technician(request, authorization)
     computer = session.get(Computer, computer_id)
     if not computer: raise HTTPException(status_code=404, detail="Computador não encontrado")

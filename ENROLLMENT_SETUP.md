@@ -7,7 +7,7 @@
 
 ## Instalação pelo usuário
 
-Abra o instalador na área de trabalho da conta Windows que usará o cliente. Siga o assistente, confirme a elevação de instalação do Windows e digite o código fornecido pela TI. Após a conclusão, abra **Prefeitura Remote - Cliente** pelo assistente ou pelo menu Iniciar.
+Abra `Vyntra-Setup.exe` na área de trabalho da conta Windows que usará o cliente. Siga o assistente, confirme a elevação de instalação do Windows e digite o código fornecido pela TI. O assistente oferece a opção de iniciar o Vyntra automaticamente ao entrar no Windows. Após a conclusão, abra **Vyntra** pelo assistente ou pelo menu Iniciar.
 
 O cliente identifica a conta da área de trabalho, gera o UUID e usa o servidor HTTPS configurado no instalador. O perfil gerenciado fica em `%ProgramData%\PrefeituraRemoteManaged\config.json` com gravação reservada a administradores e SYSTEM e leitura permitida à conta vinculada.
 
@@ -18,7 +18,7 @@ A TI pode localizar o computador no painel pelo nome informado no inventário e 
 1. Abra **Settings** do serviço existente e confirme o repositório e a branch conectados, o modo de deploy e o banco ou disco usados pelo serviço. Preserve os comandos de build e start, a configuração de persistência e as variáveis de ambiente atuais.
 2. Faça backup do banco antes de publicar. Se a tabela `activation_codes` já existe, a interface administrativa usa o esquema da versão 1.4.0. Se a tabela estiver ausente e a migração automática estiver desativada, aplique `python -B -m server.migrate --apply` com a identidade migradora no banco existente e verifique com `python -B -m server.migrate`. Em PostgreSQL externo, um pre-deploy já habilitado pode executar a migração. Para SQLite em disco persistente, execute-a em um ambiente que acesse o mesmo disco, pois o pre-deploy do Render roda em instância separada.
 3. Publique o backend e o dashboard juntos na branch conectada. Acompanhe o deploy automático existente ou selecione **Manual Deploy → Deploy latest commit** se o deploy automático estiver desligado. Confira os logs de startup e, após atualizar o painel, confirme que a seção aparece com login administrativo e fica oculta com login de técnico.
-4. Emita um código para o computador de teste, instale o cliente 1.4.0 e confirme que o registro aparece como pendente. Aprove o computador e teste a visualização e o controle com as confirmações locais.
+4. Emita um código para o computador de teste, instale o Vyntra 1.5.0 e confirme que o registro aparece como pendente. Aprove o computador e teste a visualização e o controle com as confirmações locais.
 
 ## Reinstalação, falhas e remoção
 

@@ -15,7 +15,7 @@ class SupportFeaturesTests(unittest.TestCase):
             payload = {'username':'synthetic','display_name':'Synthetic','password':'synthetic-password',field:'bad\x00text'}
             self.assertEqual(self.client.post('/api/v1/admin/technicians',json=payload,headers=self.d).status_code,422)
         self.assertEqual(self.client.post(f'/api/v1/admin/computers/{cid}/messages',
-            params={'message':'bad\x00message'},headers=self.d).status_code,400)
+            json={'message':'bad\x00message'},headers=self.d).status_code,400)
         for field in ('title','description'):
             payload = {'title':'Synthetic','description':'Synthetic',field:'bad\x00text'}
             self.assertEqual(self.client.post('/api/v1/admin/tickets',params=payload,headers=self.d).status_code,400)
@@ -41,7 +41,7 @@ class SupportFeaturesTests(unittest.TestCase):
         self.assertEqual(self.client.post('/api/v1/admin/tickets',params={'title':'x'*201,'description':'Test'},headers=self.d).status_code,400)
         cid = self.seed()
         for index in range(3):
-            self.assertEqual(self.client.post(f'/api/v1/admin/computers/{cid}/messages',params={'message':str(index)},headers=self.d).status_code,200)
+            self.assertEqual(self.client.post(f'/api/v1/admin/computers/{cid}/messages',json={'message':str(index)},headers=self.d).status_code,200)
             self.assertEqual(self.client.post('/api/v1/admin/tickets',params={'title':str(index),'description':'Test'},headers=self.d).status_code,200)
         messages = self.client.get(f'/api/v1/admin/computers/{cid}/messages',params={'limit':2},headers=self.d).json()
         self.assertEqual([row['message'] for row in messages], ['1','2'])
@@ -91,7 +91,7 @@ class SupportFeaturesTests(unittest.TestCase):
     def test_ticket_and_chat_lifecycle(self):
         cid=self.seed(); r=self.client.post(f'/api/v1/admin/tickets?title=Sem%20internet&description=Cliente%20sem%20rede&computer_id={cid}&priority=high',headers=self.d); self.assertEqual(r.status_code,200); tid=r.json()['id']
         self.assertEqual(self.client.patch(f'/api/v1/admin/tickets/{tid}?status=in_progress',headers=self.d).json()['status'],'in_progress')
-        msg=self.client.post(f'/api/v1/admin/computers/{cid}/messages?message=Vou%20verificar%20agora',headers=self.d); self.assertEqual(msg.status_code,200)
+        msg=self.client.post(f'/api/v1/admin/computers/{cid}/messages',json={'message':'Vou verificar agora'},headers=self.d); self.assertEqual(msg.status_code,200)
         messages=self.client.get(f'/api/v1/admin/computers/{cid}/messages',headers=self.d).json(); self.assertEqual(messages[-1]['message'],'Vou verificar agora'); self.assertEqual(messages[-1]['sender'],'technician')
 
 if __name__=='__main__': unittest.main()
